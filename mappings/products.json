@@ -1,0 +1,25 @@
+{
+  "source": {
+    "type": "mongodb",
+    "table": "products"
+  },
+  "target": {
+    "type": "node",
+    "label": "products"
+  },
+  "columns": {
+    "_id": "_id",
+    "product_id": "product_id",
+    "stock_quantity": "stock_quantity",
+    "weight": "weight",
+    "is_available": "is_available",
+    "created_at": "created_at",
+    "last_updated": "last_updated",
+    "price": "price",
+    "name": "name",
+    "description": "description",
+    "manufacturer": "manufacturer",
+    "category": "category",
+    "dimensions": "dimensions"
+  }
+}

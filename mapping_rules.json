@@ -1,0 +1,17 @@
+{
+  "source": {
+    "type": "postgresql",
+    "table": "Contract"
+  },
+  "target": {
+    "type": "node",
+    "label": "Contract"
+  },
+  "columns": {
+    "deal_type": "deal_type",
+    "price": "price",
+    "apartmenttype_uuid": "apartmenttype_uuid",
+    "uuid": "uuid",
+    "contract_ym": "contract_ym"
+  }
+}

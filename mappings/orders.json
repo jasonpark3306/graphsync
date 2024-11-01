@@ -1,0 +1,24 @@
+{
+  "source": {
+    "type": "mongodb",
+    "table": "orders"
+  },
+  "target": {
+    "type": "node",
+    "label": "orders"
+  },
+  "columns": {
+    "_id": "_id",
+    "order_id": "order_id",
+    "user_id": "user_id",
+    "order_date": "order_date",
+    "total_amount": "total_amount",
+    "status": "status",
+    "shipping_address": "shipping_address",
+    "billing_address": "billing_address",
+    "payment_method": "payment_method",
+    "shipping_method": "shipping_method",
+    "tracking_number": "tracking_number",
+    "notes": "notes"
+  }
+}
