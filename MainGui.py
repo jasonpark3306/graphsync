@@ -12,6 +12,7 @@ import glob
 from datetime import datetime
 import threading
 from datetime import datetime
+import time
 
 # Kafka imports
 try:
@@ -22,6 +23,47 @@ except ImportError:
         "Please install it using: pip install confluent-kafka")
 
 class DataIntegrationIDE:
+    def init_monitoring_db(self):
+        """Initialize SQLite database for monitoring"""
+        try:
+            # Delete existing database if exists
+            if os.path.exists('monitoring.db'):
+                os.remove('monitoring.db')
+                
+            conn = sqlite3.connect('monitoring.db')
+            c = conn.cursor()
+            
+            # Create tables with correct schema
+            c.execute('''CREATE TABLE IF NOT EXISTS deployed_rules
+                        (rule_name TEXT PRIMARY KEY,
+                        source_type TEXT,
+                        source_table TEXT,
+                        target_label TEXT,
+                        kafka_topic TEXT,
+                        status TEXT,
+                        last_updated TEXT)''')
+            
+            c.execute('''CREATE TABLE IF NOT EXISTS integration_status
+                        (timestamp TEXT,
+                        rule_name TEXT,
+                        records_processed INTEGER,
+                        success_count INTEGER,
+                        error_count INTEGER)''')
+            
+            c.execute('''CREATE TABLE IF NOT EXISTS topic_status
+                        (topic_name TEXT PRIMARY KEY,
+                        message_count INTEGER,
+                        last_offset INTEGER,
+                        last_updated TEXT)''')
+            
+            conn.commit()
+            conn.close()
+            self.logger.info("Monitoring database initialized successfully")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to initialize monitoring database: {str(e)}")
+            messagebox.showerror("Error", "Failed to initialize monitoring database")
+
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Data Integration IDE")
@@ -40,7 +82,7 @@ class DataIntegrationIDE:
         
         self.load_config()
         self.setup_ui()
-
+        
     def load_config(self):
         """Load configuration from db.ini file"""
         try:
@@ -278,6 +320,1196 @@ class DataIntegrationIDE:
                 self.mongo_entries[key] = entry
                 
             self.mongodb_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+
+
+    def delete_mapping(self):
+        """Delete selected mapping rule"""
+        current = self.mapping_rule_var.get()
+        if not current:
+            messagebox.showwarning("Warning", "Please select a mapping rule to delete")
+            return
+            
+        if messagebox.askyesno("Confirm Delete", 
+                            f"Are you sure you want to delete mapping rule '{current}'?"):
+            try:
+                # Delete mapping file
+                mapping_file = f"mappings/{current}.json"
+                if os.path.exists(mapping_file):
+                    os.remove(mapping_file)
+                
+                # Update combo box
+                values = list(self.mapping_rule_combo['values'])
+                values.remove(current)
+                self.mapping_rule_combo['values'] = values
+                self.mapping_rule_var.set('')
+                
+                # Clear form
+                self.clear_mapping_form()
+                
+            except Exception as e:
+                self.logger.error(f"Failed to delete mapping rule: {str(e)}")
+                messagebox.showerror("Error", "Failed to delete mapping rule")
+
+
+    def create_new_mapping(self):
+        """Create a new mapping rule"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("New Mapping Rule")
+        dialog.geometry("400x150")
+        
+        ttk.Label(dialog, text="Enter mapping rule name:").pack(pady=10)
+        
+        name_entry = ttk.Entry(dialog, width=40)
+        name_entry.pack(pady=5)
+        
+        def save_new():
+            name = name_entry.get().strip()
+            if name:
+                if name in self.mapping_rule_combo['values']:
+                    messagebox.showwarning("Warning", "A mapping rule with this name already exists")
+                    return
+                    
+                self.mapping_rule_var.set(name)
+                current_values = list(self.mapping_rule_combo['values'])
+                current_values.append(name)
+                self.mapping_rule_combo['values'] = current_values
+                self.clear_mapping_form()
+                dialog.destroy()
+            else:
+                messagebox.showwarning("Warning", "Please enter a name")
+        
+        ttk.Button(dialog, text="Create", command=save_new).pack(pady=10)
+
+
+
+      
+    def connect_source(self):
+        """Connect to source database and update table list"""
+        try:
+            # Test connection
+            if self.source_var.get() == "postgresql":
+                import psycopg2
+                config = {key: entry.get() for key, entry in self.pg_entries.items()}
+                conn = psycopg2.connect(**config)
+                conn.close()
+            elif self.source_var.get() == "mongodb":
+                from pymongo import MongoClient
+                config = {key: entry.get() for key, entry in self.mongo_entries.items()}
+                client = MongoClient(f"mongodb://{config['host']}:{config['port']}/")
+                client.server_info()
+                client.close()
+
+            # If connection successful, load tables and enable combobox
+            tables = self.load_source_tables()
+            if tables:
+                self.source_table_combo['values'] = tables
+                self.source_table_combo['state'] = 'readonly'  # Enable but readonly
+                self.update_connection_status("source", True, self.source_var.get().upper())
+                messagebox.showinfo("Success", "Connected to source database successfully!")
+            else:
+                raise Exception("No tables found in database")
+
+        except Exception as e:
+            self.update_connection_status("source", False)
+            messagebox.showerror("Connection Error", 
+                f"Failed to connect to {self.source_var.get().upper()}:\n{str(e)}")
+
+    def deploy_to_kafka(self):
+        """Deploy mapping rules to Kafka"""
+        producer = None
+        try:
+            # First, do a comprehensive Kafka check
+            if not self.test_kafka_connection_silent():
+                raise Exception("Kafka connection failed")
+
+            # Save and load mapping rules
+            self.save_mappings()
+            with open('mapping_rules.json', 'r') as f:
+                mappings = json.load(f)
+
+            # Validate mappings
+            if not mappings.get('columns'):
+                raise Exception("No columns mapped. Please map columns before deploying.")
+
+            # Create producer with robust configuration
+            producer_config = {
+                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
+                'client.id': 'data_integration_deploy',
+                'acks': 'all',
+                'retries': 3,
+                'retry.backoff.ms': 1000,
+                'delivery.timeout.ms': 10000,
+                'request.timeout.ms': 5000
+            }
+
+            topic = f"{self.kafka_entries['topic_prefix'].get()}_mappings"
+            producer = Producer(producer_config)
+
+            # Send mapping rules
+            try:
+                producer.produce(
+                    topic,
+                    key=f"{mappings['source']['table']}".encode('utf-8'),
+                    value=json.dumps(mappings).encode('utf-8')
+                )
+                
+                # Wait for delivery
+                remaining = producer.flush(timeout=5)
+                if remaining > 0:
+                    raise Exception(f"Failed to flush all messages. {remaining} messages remaining.")
+
+                # Verify the deployment
+                if self.verify_kafka_mapping():
+                    messagebox.showinfo("Success", 
+                        f"Mapping rules deployed successfully\n"
+                        f"Topic: {topic}\n"
+                        f"Source: {mappings['source']['table']}\n"
+                        f"Target: {mappings['target']['label']}")
+                else:
+                    raise Exception("Failed to verify mapping deployment")
+
+            except Exception as e:
+                raise Exception(f"Failed to send mapping rules: {str(e)}")
+
+        except Exception as e:
+            self.logger.error(f"Deployment failed: {str(e)}")
+            messagebox.showerror("Deployment Error", 
+                "Failed to deploy mapping rules:\n"
+                f"Kafka is not connected. Please check your Kafka configuration and connection.\n\n"
+                "Please check:\n"
+                "1. Kafka connection\n"
+                "2. Topic permissions\n"
+                "3. Mapping configuration")
+        finally:
+            # Clean up producer
+            if producer is not None:
+                producer.flush()  # Final flush
+                del producer  # Properly delete the producer instance
+
+    def test_kafka_connection_silent(self):
+        """Test Kafka connection without showing messages"""
+        producer = None
+        try:
+            bootstrap_servers = self.kafka_entries['bootstrap_servers'].get()
+            producer = Producer({
+                'bootstrap.servers': bootstrap_servers,
+                'socket.timeout.ms': 5000
+            })
+            producer.flush(timeout=5)
+            return True
+        except:
+            return False
+        finally:
+            if producer is not None:
+                producer.flush()
+                del producer
+
+    def verify_kafka_mapping(self):
+        """Verify the mapping was properly deployed"""
+        consumer = None
+        try:
+            consumer = Consumer({
+                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
+                'group.id': f"{self.kafka_entries['group_id'].get()}_verify",
+                'auto.offset.reset': 'earliest',
+                'session.timeout.ms': 6000,
+            })
+
+            topic = f"{self.kafka_entries['topic_prefix'].get()}_mappings"
+            consumer.subscribe([topic])
+
+            # Try multiple times with timeout
+            for _ in range(3):
+                msg = consumer.poll(timeout=2.0)
+                if msg and not msg.error():
+                    return True
+
+            return False
+
+        except Exception as e:
+            self.logger.error(f"Verification failed: {str(e)}")
+            return False
+
+        finally:
+            if consumer is not None:
+                try:
+                    consumer.close()
+                except:
+                    pass
+
+
+    def show_deployment_success(self, verification):
+        """Show successful deployment status"""
+        status_msg = (
+            f"✓ Mapping rules deployed successfully\n\n"
+            f"Topic: {verification['topic']}\n"
+            f"Source: {verification['source_table']}\n"
+            f"Target: {verification['target_label']}\n"
+            f"Mapped Columns: {verification['column_count']}\n"
+            f"Timestamp: {datetime.fromtimestamp(verification['timestamp']/1000).strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        
+        # Create status window
+        status_window = tk.Toplevel(self.root)
+        status_window.title("Deployment Status")
+        status_window.geometry("500x400")
+        
+        # Add status icon
+        success_label = ttk.Label(status_window, text="✓", font=('TkDefaultFont', 48), foreground='green')
+        success_label.pack(pady=10)
+        
+        # Status details
+        text_widget = tk.Text(status_window, wrap=tk.WORD, padx=20, pady=10)
+        text_widget.pack(fill='both', expand=True)
+        text_widget.insert('1.0', status_msg)
+        text_widget.configure(state='disabled')
+        
+        # Verification buttons
+        button_frame = ttk.Frame(status_window)
+        button_frame.pack(pady=10)
+        
+        ttk.Button(button_frame, text="Check Topic Status", 
+                command=lambda: self.show_topic_status(verification['topic'])).pack(side='left', padx=5)
+        
+        ttk.Button(button_frame, text="View Messages", 
+                command=lambda: self.show_topic_messages(verification['topic'])).pack(side='left', padx=5)
+        
+
+    def add_topic_monitoring(self):
+        # Add to monitoring screen
+        topic_frame = ttk.LabelFrame(frame, text="Kafka Topics Status")
+        self.topic_tree = ttk.Treeview(topic_frame,
+            columns=("topic", "partitions", "messages"),
+            show='headings')
+        # Show topic metrics
+
+    def validate_data_flow(self):
+        # Check source updates reaching Kafka
+        source_messages = check_topic_messages(f"{prefix}_source")
+        
+        # Check if mapping rules applied
+        mapping_status = check_mapping_application()
+        
+        # Check sink processing
+        sink_messages = check_topic_messages(f"{prefix}_sink")
+        
+    # Show flow status
+    #        
+    def show_topic_status(self, topic):
+        """Show detailed topic status"""
+
+        topics = [
+            f"{self.kafka_entries['topic_prefix'].get()}_source",
+            f"{self.kafka_entries['topic_prefix'].get()}_sink", 
+            f"{self.kafka_entries['topic_prefix'].get()}_mappings"
+        ]
+        
+        try:
+            from confluent_kafka.admin import AdminClient
+            
+            admin = AdminClient({
+                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get()
+            })
+            
+            # Get topic metadata
+            metadata = admin.list_topics(timeout=10)
+            topic_metadata = metadata.topics[topic]
+            
+            status_msg = (
+                f"Topic: {topic}\n"
+                f"Partitions: {len(topic_metadata.partitions)}\n"
+                f"State: {'Active' if not topic_metadata.error else 'Error'}\n"
+            )
+            
+            messagebox.showinfo("Topic Status", status_msg)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to get topic status: {str(e)}")
+
+    def show_topic_messages(self, topic):
+        """Show recent messages in topic"""
+        try:
+            consumer = Consumer({
+                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
+                'group.id': f"{self.kafka_entries['group_id'].get()}_view",
+                'auto.offset.reset': 'earliest'
+            })
+            
+            consumer.subscribe([topic])
+            
+            # Create message viewer window
+            viewer = tk.Toplevel(self.root)
+            viewer.title(f"Messages in {topic}")
+            viewer.geometry("600x400")
+            
+            # Message display
+            text_widget = tk.Text(viewer, wrap=tk.WORD, padx=10, pady=10)
+            text_widget.pack(fill='both', expand=True)
+            
+            # Get messages (last 10)
+            messages = []
+            while len(messages) < 10:
+                msg = consumer.poll(timeout=1.0)
+                if msg is None:
+                    break
+                if not msg.error():
+                    messages.append({
+                        'timestamp': msg.timestamp()[1],
+                        'key': msg.key().decode('utf-8') if msg.key() else None,
+                        'value': json.loads(msg.value().decode('utf-8'))
+                    })
+            
+            if messages:
+                for msg in messages:
+                    text_widget.insert('end', 
+                        f"Timestamp: {msg['timestamp']}\n"
+                        f"Key: {msg['key']}\n"
+                        f"Value: {json.dumps(msg['value'], indent=2)}\n"
+                        f"{'-'*60}\n\n"
+                    )
+            else:
+                text_widget.insert('end', "No messages found in topic")
+            
+            consumer.close()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to read topic messages: {str(e)}")
+
+    def test_complete_workflow(self):
+        """Test complete workflow from mapping to monitoring"""
+        try:
+            # 1. Verify source connection
+            if not self.check_source_connection():
+                return "Source database not connected"
+                
+            # 2. Verify Kafka connection
+            if not self.test_kafka_connection_silent():
+                return "Kafka not connected"
+                
+            # 3. Verify Neo4j connection
+            try:
+                self.test_neo4j_connection()
+            except:
+                return "Neo4j not connected"
+                
+            # 4. Check mapping deployment
+            topic = f"{self.kafka_entries['topic_prefix'].get()}_mappings"
+            producer = Producer({
+                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get()
+            })
+            producer.flush()
+            
+            # 5. Verify monitoring setup
+            if not self.check_database_status():
+                return "Monitoring database not initialized"
+                
+            return "All systems verified and working"
+            
+        except Exception as e:
+            return f"Workflow test failed: {str(e)}"
+                
+    def create_monitoring(self):
+        frame = ttk.Frame(self.notebook)
+        
+        # Create main layout with three panes instead of two
+        paned = ttk.PanedWindow(frame, orient='vertical')
+        paned.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # Top frame for deployed rules
+        rules_frame = ttk.LabelFrame(paned, text="Deployed Mapping Rules")
+        paned.add(rules_frame)
+        
+        # Rules Treeview - Add topic column
+        self.rules_tree = ttk.Treeview(rules_frame, 
+                                    columns=("rule", "source", "target", "topic", "status"),
+                                    show='headings',
+                                    height=6)
+        self.rules_tree.heading("rule", text="Rule Name")
+        self.rules_tree.heading("source", text="Source")
+        self.rules_tree.heading("target", text="Target")
+        self.rules_tree.heading("topic", text="Kafka Topic")  # New column
+        self.rules_tree.heading("status", text="Status")
+        
+        self.rules_tree.column("rule", width=150)
+        self.rules_tree.column("source", width=150)
+        self.rules_tree.column("target", width=150)
+        self.rules_tree.column("topic", width=150)  # New column
+        self.rules_tree.column("status", width=100)
+        
+        # Add scrollbar to rules tree
+        rules_scroll = ttk.Scrollbar(rules_frame, orient="vertical", command=self.rules_tree.yview)
+        self.rules_tree.configure(yscrollcommand=rules_scroll.set)
+        
+        self.rules_tree.pack(side='left', fill='both', expand=True)
+        rules_scroll.pack(side='right', fill='y')
+        
+        # Bottom frame for sync status
+        status_frame = ttk.LabelFrame(paned, text="Synchronization Status")
+        paned.add(status_frame)
+        
+        # Status Treeview
+        self.status_tree = ttk.Treeview(status_frame, 
+                                    columns=("timestamp", "rule", "records", "success", "errors"),
+                                    show='headings',
+                                    height=8)
+        self.status_tree.heading("timestamp", text="Timestamp")
+        self.status_tree.heading("rule", text="Rule Name")
+        self.status_tree.heading("records", text="Records Processed")
+        self.status_tree.heading("success", text="Success Count")
+        self.status_tree.heading("errors", text="Error Count")
+        
+        self.status_tree.column("timestamp", width=150)
+        self.status_tree.column("rule", width=150)
+        self.status_tree.column("records", width=100)
+        self.status_tree.column("success", width=100)
+        self.status_tree.column("errors", width=100)
+        
+        # Add scrollbar to status tree
+        status_scroll = ttk.Scrollbar(status_frame, orient="vertical", command=self.status_tree.yview)
+        self.status_tree.configure(yscrollcommand=status_scroll.set)
+        
+        self.status_tree.pack(side='left', fill='both', expand=True)
+        status_scroll.pack(side='right', fill='y')
+        
+        # Control frame
+        control_frame = ttk.Frame(frame)
+        control_frame.pack(fill='x', padx=10, pady=5)
+
+        # Add to control_frame in create_monitoring
+        ttk.Button(control_frame, text="Diagnostic Check", 
+                command=lambda: messagebox.showinfo(
+                    "System Check", 
+                    self.test_complete_workflow()
+                )).pack(side='left', padx=5)
+        
+        # Left side buttons
+        left_buttons_frame = ttk.Frame(control_frame)
+        left_buttons_frame.pack(side='left')
+        
+        ttk.Button(left_buttons_frame, text="Refresh Status", 
+                command=self.refresh_monitoring).pack(side='left', padx=5)
+        ttk.Button(left_buttons_frame, text="View Details", 
+                command=self.show_sync_details).pack(side='left', padx=5)
+        
+        # Right side buttons
+        right_buttons_frame = ttk.Frame(control_frame)
+        right_buttons_frame.pack(side='right')
+        
+        ttk.Button(right_buttons_frame, text="Verify Sync", 
+                command=self.verify_data_sync).pack(side='left', padx=5)
+        ttk.Button(right_buttons_frame, text="Start Monitoring", 
+                command=self.start_monitoring).pack(side='left', padx=5)
+        ttk.Button(right_buttons_frame, text="Stop Monitoring", 
+                command=self.stop_monitoring).pack(side='left', padx=5)
+        
+
+        # Rules Treeview actions frame
+        rules_actions = ttk.Frame(rules_frame)
+        rules_actions.pack(fill='x', padx=5, pady=5)
+        
+        ttk.Button(rules_actions, text="Show Topics",
+                command=lambda: self.show_rule_topics(
+                    self.rules_tree.item(self.rules_tree.selection()[0])['values'][0]
+                    if self.rules_tree.selection() else None
+                )).pack(side='left', padx=5)
+        
+        ttk.Button(rules_actions, text="Verify Sync",
+                command=self.verify_data_sync).pack(side='left', padx=5)
+        
+        
+        # Status bar
+        status_bar = ttk.Frame(frame)
+        status_bar.pack(fill='x', padx=10, pady=5)
+        
+        # Connection status indicators frame
+        conn_status_frame = ttk.Frame(status_bar)
+        conn_status_frame.pack(side='left')
+        
+        # Source status with icon
+        source_frame = ttk.Frame(conn_status_frame)
+        source_frame.pack(side='left', padx=10)
+        self.source_status = ttk.Label(source_frame, text="Source: Not Connected")
+        self.source_status.pack(side='left')
+        self.source_indicator = tk.Canvas(source_frame, width=12, height=12)
+        self.source_indicator.pack(side='left', padx=5)
+        
+        # Sink status with icon
+        sink_frame = ttk.Frame(conn_status_frame)
+        sink_frame.pack(side='left', padx=10)
+        self.sink_status = ttk.Label(sink_frame, text="Sink: Not Connected")
+        self.sink_status.pack(side='left')
+        self.sink_indicator = tk.Canvas(sink_frame, width=12, height=12)
+        self.sink_indicator.pack(side='left', padx=5)
+        
+        # Initialize monitoring state
+        self.monitoring_active = False
+        self.update_monitoring_status()
+        
+        # Update initial status indicators
+        self.update_connection_indicators()
+        
+        return frame
+
+    def update_connection_indicators(self):
+        """Update the connection status indicators"""
+        def draw_indicator(canvas, connected):
+            canvas.delete("all")
+            color = "#2ECC71" if connected else "#E74C3C"  # Green if connected, red if not
+            canvas.create_oval(2, 2, 10, 10, fill=color, outline=color)
+        
+        # Update source indicator
+        draw_indicator(self.source_indicator, self.monitoring_active)
+        self.source_status.config(
+            text="Source: Connected" if self.monitoring_active else "Source: Not Connected",
+            foreground="#2ECC71" if self.monitoring_active else "#E74C3C"
+        )
+        
+        # Update sink indicator
+        draw_indicator(self.sink_indicator, self.monitoring_active)
+        self.sink_status.config(
+            text="Sink: Connected" if self.monitoring_active else "Sink: Not Connected",
+            foreground="#2ECC71" if self.monitoring_active else "#E74C3C"
+        )
+
+
+    def start_auto_refresh(self):
+        """Start auto-refresh for monitoring"""
+        def refresh_loop():
+            if self.auto_refresh_var.get():
+                self.refresh_monitoring()
+            self.root.after(5000, refresh_loop)  # Refresh every 5 seconds
+        
+        refresh_loop()
+        
+    def setup_kafka_config(self):
+        """Initialize Kafka configuration"""
+        self.kafka_config = {
+            'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
+            'client.id': 'data_integration_client',
+            'group.id': self.kafka_entries['group_id'].get(),
+            'auto.offset.reset': self.auto_offset.get(),
+            'socket.timeout.ms': 10000
+        }
+
+
+    def run_integration(self):
+        # Initialize SQLite monitoring database
+        self.init_monitoring_db()
+        
+        # Start Kafka consumers and producers
+        self.start_kafka_streaming()
+        
+        # Begin monitoring
+        self.start_monitoring()
+
+
+    def monitor_topics(self):
+        """Monitor Kafka topics and update status"""
+        try:
+            from confluent_kafka.admin import AdminClient
+            
+            admin_client = AdminClient({
+                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get()
+            })
+            
+            # Get topic list
+            topics = admin_client.list_topics(timeout=10)
+            
+            conn = sqlite3.connect('monitoring.db')
+            c = conn.cursor()
+            
+            for topic_name, topic_metadata in topics.topics.items():
+                if topic_name.startswith(self.kafka_entries['topic_prefix'].get()):
+                    # Get message count and offset information
+                    message_count = 0
+                    last_offset = 0
+                    
+                    for partition in topic_metadata.partitions.values():
+                        last_offset = max(last_offset, partition.high_watermark)
+                        message_count += partition.high_watermark - partition.low_watermark
+                    
+                    # Update database
+                    c.execute('''INSERT OR REPLACE INTO topic_status 
+                                (topic_name, message_count, last_offset, last_updated)
+                                VALUES (?, ?, ?, datetime('now'))''',
+                            (topic_name, message_count, last_offset))
+            
+            conn.commit()
+            conn.close()
+            
+        except Exception as e:
+            self.logger.error(f"Failed to monitor topics: {str(e)}")
+            
+    def create_monitoring(self):
+        frame = ttk.Frame(self.notebook)
+        
+        # Create main layout with two panes
+        paned = ttk.PanedWindow(frame, orient='vertical')
+        paned.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # Top frame for deployed rules
+        rules_frame = ttk.LabelFrame(paned, text="Deployed Mapping Rules")
+        paned.add(rules_frame)
+        
+        # Rules Treeview
+        self.rules_tree = ttk.Treeview(rules_frame, 
+                                    columns=("rule", "source", "target", "status"),
+                                    show='headings',
+                                    height=6)
+        self.rules_tree.heading("rule", text="Rule Name")
+        self.rules_tree.heading("source", text="Source")
+        self.rules_tree.heading("target", text="Target")
+        self.rules_tree.heading("status", text="Status")
+        
+        self.rules_tree.column("rule", width=150)
+        self.rules_tree.column("source", width=200)
+        self.rules_tree.column("target", width=200)
+        self.rules_tree.column("status", width=100)
+        
+        # Add scrollbar to rules tree
+        rules_scroll = ttk.Scrollbar(rules_frame, orient="vertical", command=self.rules_tree.yview)
+        self.rules_tree.configure(yscrollcommand=rules_scroll.set)
+        
+        self.rules_tree.pack(side='left', fill='both', expand=True)
+        rules_scroll.pack(side='right', fill='y')
+        
+        # Bottom frame for sync status
+        status_frame = ttk.LabelFrame(paned, text="Synchronization Status")
+        paned.add(status_frame)
+        
+        # Status Treeview
+        self.status_tree = ttk.Treeview(status_frame, 
+                                    columns=("timestamp", "rule", "records", "success", "errors"),
+                                    show='headings',
+                                    height=8)
+        self.status_tree.heading("timestamp", text="Timestamp")
+        self.status_tree.heading("rule", text="Rule Name")
+        self.status_tree.heading("records", text="Records Processed")
+        self.status_tree.heading("success", text="Success Count")
+        self.status_tree.heading("errors", text="Error Count")
+        
+        self.status_tree.column("timestamp", width=150)
+        self.status_tree.column("rule", width=150)
+        self.status_tree.column("records", width=100)
+        self.status_tree.column("success", width=100)
+        self.status_tree.column("errors", width=100)
+        
+        # Add scrollbar to status tree
+        status_scroll = ttk.Scrollbar(status_frame, orient="vertical", command=self.status_tree.yview)
+        self.status_tree.configure(yscrollcommand=status_scroll.set)
+        
+        self.status_tree.pack(side='left', fill='both', expand=True)
+        status_scroll.pack(side='right', fill='y')
+        
+        # Control frame
+        control_frame = ttk.Frame(frame)
+        control_frame.pack(fill='x', padx=10, pady=5)
+        
+        # Add control buttons
+        ttk.Button(control_frame, text="Refresh Status", 
+                command=self.refresh_monitoring).pack(side='left', padx=5)
+        ttk.Button(control_frame, text="View Details", 
+                command=self.show_sync_details).pack(side='left', padx=5)
+        ttk.Button(control_frame, text="Start Monitoring", 
+                command=self.start_monitoring).pack(side='right', padx=5)
+        ttk.Button(control_frame, text="Stop Monitoring", 
+                command=self.stop_monitoring).pack(side='right', padx=5)
+        
+        # Status bar
+        status_bar = ttk.Frame(frame)
+        status_bar.pack(fill='x', padx=10, pady=5)
+        
+        # Kafka status indicators
+        self.source_status = ttk.Label(status_bar, text="Source: Not Connected")
+        self.source_status.pack(side='left', padx=10)
+        self.sink_status = ttk.Label(status_bar, text="Sink: Not Connected")
+        self.sink_status.pack(side='left', padx=10)
+        
+        # Initialize monitoring
+        self.monitoring_active = False
+        self.update_monitoring_status()
+        
+        return frame   
+
+
+    def show_rule_topics(self, rule_name):
+        """Show topics for a specific rule"""
+        topics = self.get_rule_topics(rule_name)
+        if not topics:
+            messagebox.showerror("Error", f"Failed to get topics for rule {rule_name}")
+            return
+            
+        # Create topics window
+        topics_window = tk.Toplevel(self.root)
+        topics_window.title(f"Kafka Topics for {rule_name}")
+        topics_window.geometry("600x400")
+        
+        # Create topic tree
+        topic_tree = ttk.Treeview(topics_window, 
+                                columns=("type", "name", "partitions", "status"),
+                                show='headings')
+        
+        topic_tree.heading("type", text="Type")
+        topic_tree.heading("name", text="Topic Name")
+        topic_tree.heading("partitions", text="Partitions")
+        topic_tree.heading("status", text="Status")
+        
+        topic_tree.column("type", width=100)
+        topic_tree.column("name", width=250)
+        topic_tree.column("partitions", width=100)
+        topic_tree.column("status", width=100)
+        
+        # Add topics to tree
+        for topic_type, info in topics.items():
+            status = "Active" if info['exists'] and not info['error'] else "Error"
+            topic_tree.insert('', 'end', values=(
+                topic_type.title(),
+                info['name'],
+                info['partitions'],
+                status
+            ))
+        
+        topic_tree.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # Add refresh button
+        ttk.Button(topics_window, text="Refresh",
+                command=lambda: self.refresh_topics_window(topics_window, rule_name)).pack(pady=5)
+
+    def get_rule_topics(self, rule_name):
+        """Get all topics associated with a rule"""
+        try:
+            prefix = self.kafka_entries['topic_prefix'].get()
+            topics = {
+                'source': f"{prefix}_{rule_name}_source",
+                'sink': f"{prefix}_{rule_name}_sink",
+                'mapping': f"{prefix}_mappings"
+            }
+            
+            # Check if topics exist
+            admin_client = AdminClient({
+                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get()
+            })
+            
+            existing_topics = admin_client.list_topics().topics
+            
+            topic_status = {}
+            for topic_type, topic_name in topics.items():
+                if topic_name in existing_topics:
+                    metadata = existing_topics[topic_name]
+                    topic_status[topic_type] = {
+                        'name': topic_name,
+                        'exists': True,
+                        'partitions': len(metadata.partitions),
+                        'error': metadata.error
+                    }
+                else:
+                    topic_status[topic_type] = {
+                        'name': topic_name,
+                        'exists': False,
+                        'partitions': 0,
+                        'error': None
+                    }
+                    
+            return topic_status
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get topics for rule {rule_name}: {str(e)}")
+            return None
+        
+        
+    def refresh_monitoring(self):
+        """Refresh monitoring data"""
+        try:
+            # Clear existing items
+            self.rules_tree.delete(*self.rules_tree.get_children())
+            self.status_tree.delete(*self.status_tree.get_children())
+            
+            conn = sqlite3.connect('monitoring.db')
+            c = conn.cursor()
+            
+            # Get deployed rules
+            c.execute('''SELECT rule_name, source_type, source_table, 
+                        target_label, status, kafka_topic
+                        FROM deployed_rules''')
+            
+            deployed_rules = c.fetchall()
+            
+            if deployed_rules:
+                for rule in deployed_rules:
+                    self.rules_tree.insert('', 'end', values=(
+                        rule[0],  # rule_name
+                        f"{rule[1]} - {rule[2]}",  # source
+                        f"Neo4j - {rule[3]}",  # target
+                        rule[5] if rule[5] else "Not Set",  # kafka_topic
+                        rule[4]   # status
+                    ))
+                    
+                # Get sync status
+                c.execute('''SELECT timestamp, rule_name, records_processed, 
+                            success_count, error_count 
+                            FROM integration_status 
+                            ORDER BY timestamp DESC LIMIT 100''')
+                
+                status_rows = c.fetchall()
+                if status_rows:
+                    for row in status_rows:
+                        self.status_tree.insert('', 'end', values=row)
+                else:
+                    # Add initial status for deployed rules
+                    for rule in deployed_rules:
+                        self.status_tree.insert('', 'end', values=(
+                            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            rule[0],
+                            0, 0, 0
+                        ))
+            else:
+                # No deployed rules
+                self.status_tree.insert('', 'end', values=(
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'No Data',
+                    0, 0, 0
+                ))
+                
+            conn.close()
+            
+        except Exception as e:
+            self.logger.error(f"Failed to refresh monitoring: {str(e)}")
+            messagebox.showerror("Error", "Failed to refresh monitoring data")
+
+
+    def check_rule_deployment(self, rule_name):
+        """Check if a rule is deployed to Kafka and monitoring database"""
+        try:
+            # Check database status first
+            conn = sqlite3.connect('monitoring.db')
+            c = conn.cursor()
+            
+            c.execute('''SELECT status FROM deployed_rules 
+                        WHERE rule_name = ? AND status = 'Deployed' ''', 
+                    (rule_name,))
+            
+            db_deployed = c.fetchone() is not None
+            conn.close()
+            
+            if not db_deployed:
+                return False
+                
+            # Then check Kafka
+            consumer = Consumer({
+                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
+                'group.id': f"{self.kafka_entries['group_id'].get()}_check",
+                'auto.offset.reset': 'earliest'
+            })
+            
+            topic = f"{self.kafka_entries['topic_prefix'].get()}_mappings"
+            consumer.subscribe([topic])
+            
+            # Try to find the rule in topic
+            found = False
+            start_time = time.time()
+            while time.time() - start_time < 2:  # 2 second timeout
+                msg = consumer.poll(timeout=1.0)
+                if msg is None:
+                    continue
+                    
+                if msg.error():
+                    continue
+                    
+                try:
+                    key = msg.key().decode('utf-8')
+                    if key == rule_name:
+                        found = True
+                        break
+                except:
+                    continue
+                    
+            consumer.close()
+            return found and db_deployed
+            
+        except Exception as e:
+            self.logger.error(f"Failed to check rule deployment: {str(e)}")
+            return False
+        
+    def verify_data_sync(self):
+        """Verify data synchronization between source and Neo4j"""
+        try:
+            # Get current mapping rule
+            selected = self.rules_tree.selection()
+            if not selected:
+                messagebox.showwarning("Warning", "Please select a mapping rule to verify")
+                return
+                
+            rule_name = self.rules_tree.item(selected[0])['values'][0]
+            
+            # Load mapping configuration
+            with open(f'mappings/{rule_name}.json', 'r') as f:
+                mapping = json.load(f)
+                
+            # Check source data
+            source_count = self.get_source_count(mapping)
+            
+            # Check Neo4j data
+            target_count = self.get_neo4j_count(mapping)
+            
+            # Create verification window
+            verify_window = tk.Toplevel(self.root)
+            verify_window.title("Data Sync Verification")
+            verify_window.geometry("400x300")
+            
+            # Add verification details
+            text = tk.Text(verify_window, wrap=tk.WORD, padx=10, pady=10)
+            text.pack(fill='both', expand=True)
+            
+            text.insert('end', f"Rule: {rule_name}\n\n")
+            text.insert('end', f"Source Records: {source_count}\n")
+            text.insert('end', f"Neo4j Nodes: {target_count}\n")
+            text.insert('end', f"\nSync Status: ")
+            
+            if source_count == target_count:
+                text.insert('end', "✓ Fully Synced\n")
+            else:
+                text.insert('end', f"⚠ Pending Sync\n")
+                text.insert('end', f"Records remaining: {source_count - target_count}\n")
+            
+            text.configure(state='disabled')
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to verify data sync: {str(e)}")
+
+    def get_source_count(self, mapping):
+        """Get record count from source database"""
+        try:
+            if mapping['source']['type'] == 'postgresql':
+                import psycopg2
+                config = {key: entry.get() for key, entry in self.pg_entries.items()}
+                conn = psycopg2.connect(**config)
+                cursor = conn.cursor()
+                cursor.execute(f"SELECT COUNT(*) FROM {mapping['source']['table']}")
+                count = cursor.fetchone()[0]
+                conn.close()
+                return count
+                
+            elif mapping['source']['type'] == 'mongodb':
+                from pymongo import MongoClient
+                config = {key: entry.get() for key, entry in self.mongo_entries.items()}
+                client = MongoClient(f"mongodb://{config['host']}:{config['port']}/")
+                db = client[config['database']]
+                count = db[mapping['source']['table']].count_documents({})
+                client.close()
+                return count
+                
+        except Exception as e:
+            self.logger.error(f"Failed to get source count: {str(e)}")
+            return 0
+
+    def get_neo4j_count(self, mapping):
+        """Get node count from Neo4j"""
+        try:
+            from neo4j import GraphDatabase
+            
+            config = {key: entry.get() for key, entry in self.neo4j_entries.items()}
+            driver = GraphDatabase.driver(
+                config['url'],
+                auth=(config['user'], config['password'])
+            )
+            
+            with driver.session() as session:
+                result = session.run(
+                    f"MATCH (n:{mapping['target']['label']}) RETURN COUNT(n) as count"
+                )
+                count = result.single()['count']
+                
+            driver.close()
+            return count
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get Neo4j count: {str(e)}")
+            return 0
+            
+    def check_database_status(self):
+        """Check if monitoring database is properly initialized"""
+        try:
+            conn = sqlite3.connect('monitoring.db')
+            c = conn.cursor()
+            
+            # Check if tables exist
+            c.execute("""SELECT name FROM sqlite_master 
+                        WHERE type='table' AND 
+                        name IN ('integration_status', 'deployed_rules')""")
+            
+            existing_tables = set(row[0] for row in c.fetchall())
+            required_tables = {'integration_status', 'deployed_rules'}
+            
+            conn.close()
+            
+            if not required_tables.issubset(existing_tables):
+                self.logger.info("Reinitializing monitoring database")
+                self.init_monitoring_db()
+                
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Database status check failed: {str(e)}")
+            return False
+        
+        
+    def update_status_tree(self):
+        """Update status tree with recent sync results"""
+        try:
+            # Ensure database exists
+            self.init_monitoring_db()
+            
+            # Clear existing items
+            self.status_tree.delete(*self.status_tree.get_children())
+            
+            # Load status from SQLite
+            conn = sqlite3.connect('monitoring.db')
+            c = conn.cursor()
+            
+            # Get recent status entries
+            c.execute('''SELECT timestamp, rule_name, records_processed, 
+                            success_count, error_count 
+                        FROM integration_status 
+                        ORDER BY timestamp DESC LIMIT 100''')
+            
+            rows = c.fetchall()
+            
+            if not rows:
+                # Add placeholder text if no data
+                self.status_tree.insert('', 'end', values=(
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'No Data',
+                    0,
+                    0,
+                    0
+                ))
+            else:
+                for row in rows:
+                    self.status_tree.insert('', 'end', values=row)
+                
+            conn.close()
+            
+        except sqlite3.OperationalError as e:
+            self.logger.error(f"Database error: {str(e)}")
+            self.init_monitoring_db()  # Try to reinitialize the database
+            
+        except Exception as e:
+            self.logger.error(f"Failed to update status tree: {str(e)}")
+
+    def start_monitoring(self):
+        """Start monitoring Kafka topics"""
+        if not self.monitoring_active:
+            # Check database status before starting
+            if not self.check_database_status():
+                messagebox.showerror("Error", "Failed to initialize monitoring database")
+                return
+                
+            self.monitoring_active = True
+            self.monitor_thread = threading.Thread(target=self.monitor_kafka_topics, daemon=True)
+            self.monitor_thread.start()
+            self.update_monitoring_status()
+
+    def stop_monitoring(self):
+        """Stop monitoring Kafka topics"""
+        self.monitoring_active = False
+        self.update_monitoring_status()
+
+    def update_monitoring_status(self):
+        """Update monitoring status indicators"""
+        if self.monitoring_active:
+            self.source_status.config(text="Source: Connected", foreground='green')
+            self.sink_status.config(text="Sink: Connected", foreground='green')
+        else:
+            self.source_status.config(text="Source: Not Connected", foreground='red')
+            self.sink_status.config(text="Sink: Not Connected", foreground='red')
+
+    def monitor_kafka_topics(self):
+        """Background thread to monitor Kafka topics"""
+        try:
+            consumer = Consumer({
+                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
+                'group.id': f"{self.kafka_entries['group_id'].get()}_monitor",
+                'auto.offset.reset': 'latest'
+            })
+            
+            # Subscribe to source and sink topics
+            source_topic = f"{self.kafka_entries['topic_prefix'].get()}_source"
+            sink_topic = f"{self.kafka_entries['topic_prefix'].get()}_sink"
+            consumer.subscribe([source_topic, sink_topic])
+            
+            while self.monitoring_active:
+                msg = consumer.poll(timeout=1.0)
+                if msg is None:
+                    continue
+                    
+                if msg.error():
+                    continue
+                    
+                # Process message and update status
+                try:
+                    data = json.loads(msg.value().decode('utf-8'))
+                    self.update_sync_status(msg.topic(), data)
+                except:
+                    continue
+                    
+            consumer.close()
+            
+        except Exception as e:
+            self.logger.error(f"Monitoring error: {str(e)}")
+            self.monitoring_active = False
+            self.update_monitoring_status()
+
+    def update_sync_status(self, topic, data):
+        """Update sync status in database"""
+        try:
+            conn = sqlite3.connect('monitoring.db')
+            c = conn.cursor()
+            
+            c.execute('''INSERT INTO integration_status 
+                        (timestamp, rule_name, records_processed, success_count, error_count)
+                        VALUES (datetime('now'), ?, ?, ?, ?)''',
+                    (data.get('rule_name', 'Unknown'),
+                    data.get('records_processed', 0),
+                    data.get('success_count', 0),
+                    data.get('error_count', 0)))
+            
+            conn.commit()
+            conn.close()
+            
+            # Update UI in main thread
+            self.root.after(0, self.update_status_tree)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to update sync status: {str(e)}")
+
+    def show_sync_details(self):
+        """Show detailed sync information"""
+        selected = self.status_tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "Please select a status entry to view details")
+            return
+            
+        # Get selected status
+        values = self.status_tree.item(selected[0])['values']
+        
+        # Create details window
+        details = tk.Toplevel(self.root)
+        details.title("Sync Details")
+        details.geometry("500x400")
+        
+        # Add details
+        text = tk.Text(details, wrap=tk.WORD, padx=10, pady=10)
+        text.pack(fill='both', expand=True)
+        
+        text.insert('end', f"Timestamp: {values[0]}\n")
+        text.insert('end', f"Rule Name: {values[1]}\n")
+        text.insert('end', f"Records Processed: {values[2]}\n")
+        text.insert('end', f"Success Count: {values[3]}\n")
+        text.insert('end', f"Error Count: {values[4]}\n")
+        
+        text.configure(state='disabled')
+        
 
 
     def create_steps(self):
@@ -795,70 +2027,7 @@ class DataIntegrationIDE:
             self.update_connection_status("source", False)
             messagebox.showerror("Connection Error", f"{error_msg}:\n{str(e)}")
 
-    def load_source_tables(self):
-        """Load available tables/collections from source database"""
-        try:
-            tables = []
-            if self.source_var.get() == "postgresql":
-                try:
-                    import psycopg2
-                    # Get configuration from entries
-                    config = {}
-                    if hasattr(self, 'pg_entries'):
-                        config = {key: entry.get() for key, entry in self.pg_entries.items()}
-                    else:
-                        # Use config from file if entries not yet created
-                        config = self.config['postgresql']
-                    
-                    conn = psycopg2.connect(
-                        host=config['host'],
-                        port=config['port'],
-                        database=config['database'],
-                        user=config['user'],
-                        password=config['password']
-                    )
-                    cursor = conn.cursor()
-                    cursor.execute("""
-                        SELECT table_name 
-                        FROM information_schema.tables 
-                        WHERE table_schema = 'public'
-                        ORDER BY table_name
-                    """)
-                    tables = [row[0] for row in cursor.fetchall()]
-                    conn.close()
-                    
-                except Exception as e:
-                    self.logger.error(f"Failed to load PostgreSQL tables: {str(e)}")
-                    
-            elif self.source_var.get() == "mongodb":
-                try:
-                    from pymongo import MongoClient
-                    config = {}
-                    if hasattr(self, 'mongo_entries'):
-                        config = {key: entry.get() for key, entry in self.mongo_entries.items()}
-                    else:
-                        config = self.config['mongodb']
-                    
-                    client = MongoClient(f"mongodb://{config['host']}:{config['port']}/")
-                    db = client[config['database']]
-                    tables = sorted(db.list_collection_names())
-                    client.close()
-                    
-                except Exception as e:
-                    self.logger.error(f"Failed to load MongoDB collections: {str(e)}")
-
-            # Update combobox with new values
-            if hasattr(self, 'source_table_combo'):
-                self.source_table_combo['values'] = tables
-                if tables:
-                    self.source_table_combo.set('')  # Clear current selection
-
-            return tables
-                
-        except Exception as e:
-            self.logger.error(f"Failed to load source tables: {str(e)}")
-            messagebox.showerror("Error", f"Failed to load tables/collections: {str(e)}")
-            return []
+   
         
     def load_source_fields(self, event=None):
         """Load fields from selected table/collection"""
@@ -925,16 +2094,16 @@ class DataIntegrationIDE:
         ttk.Label(dialog, text="Transformation (optional):").pack(pady=5)
         transformation = ttk.Entry(dialog)
         transformation.pack(pady=5)
+    
+    def save_rule():
+        self.mapping_rules.insert('', 'end', values=(
+            source_field,
+            target_field.get(),
+            transformation.get()
+        ))
+        dialog.destroy()
         
-        def save_rule():
-            self.mapping_rules.insert('', 'end', values=(
-                source_field,
-                target_field.get(),
-                transformation.get()
-            ))
-            dialog.destroy()
-            
-        ttk.Button(dialog, text="Save", command=save_rule).pack(pady=10)
+    ttk.Button(dialog, text="Save", command=save_rule).pack(pady=10)
 
     def remove_mapping_rule(self):
         """Remove selected mapping rule"""
@@ -989,6 +2158,40 @@ class DataIntegrationIDE:
             # Reset target label entry if it was showing a relationship type
             self.target_label_entry.delete(0, tk.END)
 
+
+    def load_selected_mapping(self, event=None):
+        """Load selected mapping rule"""
+        current = self.mapping_rule_var.get()
+        if not current:
+            return
+            
+        try:
+            mapping_file = f"mappings/{current}.json"
+            if os.path.exists(mapping_file):
+                with open(mapping_file, 'r') as f:
+                    mapping = json.load(f)
+                    
+                # Update form with mapping data
+                self.source_table_var.set(mapping['source']['table'])
+                self.target_label_entry.delete(0, tk.END)
+                self.target_label_entry.insert(0, mapping['target']['label'])
+                
+                # Clear existing mappings
+                self.mapped_columns.delete(*self.mapped_columns.get_children())
+                
+                # Load mapped columns
+                for source_col, target_col in mapping['columns'].items():
+                    self.mapped_columns.insert('', 'end', values=(source_col, target_col))
+                    
+                # Load source fields for the selected table
+                self.load_source_fields()
+                
+        except Exception as e:
+            self.logger.error(f"Failed to load mapping rule: {str(e)}")
+            messagebox.showerror("Error", "Failed to load mapping rule")
+            
+
+
     def create_mapping_rules(self):
         frame = ttk.Frame(self.notebook)
         
@@ -1019,24 +2222,34 @@ class DataIntegrationIDE:
                 command=self.create_new_mapping).pack(side='left', padx=2)
         ttk.Button(rule_select_frame, text="Delete", 
                 command=self.delete_mapping).pack(side='left', padx=2)
-        
+            
+
         # Source selection frame
         source_frame = ttk.LabelFrame(mapping_frame, text="Source")
         source_frame.pack(fill='x', padx=5, pady=5)
-        
+
+        # Source connection frame
+        source_conn_frame = ttk.Frame(source_frame)
+        source_conn_frame.pack(fill='x', padx=5, pady=2)
 
         # Show source type
         source_type = self.source_var.get().upper()
-        ttk.Label(source_frame, text=f"Source Type: {source_type}").pack(side='left', padx=5)
+        ttk.Label(source_conn_frame, text=f"Source Type: {source_type}").pack(side='left', padx=5)
 
-        # Add source type change detection
-        self.source_var.trace_add('write', self.on_source_type_changed)
+        # Add Connect button
+        ttk.Button(source_conn_frame, text="Connect", 
+                command=self.connect_source).pack(side='right', padx=5)
+
+        # Source table selector frame
+        table_frame = ttk.Frame(source_frame)
+        table_frame.pack(fill='x', padx=5, pady=2)
 
         # Source table/collection selector
-        ttk.Label(source_frame, text="Table/Collection:").pack(side='left', padx=5)
-        self.source_table_combo = ttk.Combobox(source_frame, 
+        ttk.Label(table_frame, text="Table/Collection:").pack(side='left', padx=5)
+        self.source_table_combo = ttk.Combobox(table_frame, 
                                             textvariable=self.source_table_var, 
-                                            width=30)
+                                            width=30,
+                                            state='disabled')  # Initially disabled
         self.source_table_combo.pack(side='left', padx=5)
         self.source_table_combo.bind('<<ComboboxSelected>>', self.on_table_selected)
 
@@ -1168,42 +2381,236 @@ class DataIntegrationIDE:
             self.logger.error(f"Failed to save mapping rule: {str(e)}")
             messagebox.showerror("Error", "Failed to save mapping rule")
 
-    def deploy_selected_mapping(self):
-        """Deploy currently selected mapping rule to Kafka"""
-        current = self.mapping_rule_var.get()
-        if not current:
-            messagebox.showwarning("Warning", "Please select a mapping rule to deploy")
-            return
+def deploy_selected_mapping(self):
+    """Deploy currently selected mapping rule to Kafka"""
+    current = self.mapping_rule_var.get()  # Get currently selected mapping rule
+    if not current:
+        messagebox.showwarning("Warning", "Please select a mapping rule to deploy")
+        return
             
+    try:
+        # Load mapping rule
+        mapping_file = f"mappings/{current}.json"
+        if not os.path.exists(mapping_file):
+            raise Exception("Mapping file not found")
+            
+        with open(mapping_file, 'r') as f:
+            mapping = json.load(f)
+        
+        # Create topic names        
+        source_topic = f"{self.kafka_entries['topic_prefix'].get()}_{mapping['source']['table']}_source"
+        sink_topic = f"{self.kafka_entries['topic_prefix'].get()}_{mapping['source']['table']}_sink"
+        mapping_topic = f"{self.kafka_entries['topic_prefix'].get()}_mappings"
+        
+        # Test Kafka connection first
+        if not self.test_kafka_connection_silent():
+            raise Exception("Kafka is not connected. Please check your Kafka configuration.")
+
+        # Create topics if they don't exist
+        from confluent_kafka.admin import AdminClient, NewTopic
+        admin_client = AdminClient({
+            'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get()
+        })
+
+        existing_topics = admin_client.list_topics().topics
+        topics_to_create = []
+
+        for topic in [source_topic, sink_topic, mapping_topic]:
+            if topic not in existing_topics:
+                topics_to_create.append(NewTopic(
+                    topic,
+                    num_partitions=1,
+                    replication_factor=1
+                ))
+
+        if topics_to_create:
+            fs = admin_client.create_topics(topics_to_create)
+            for topic, f in fs.items():
+                try:
+                    f.result(timeout=5)  # Wait for topic creation
+                except Exception as e:
+                    raise Exception(f"Failed to create topic {topic}: {str(e)}")
+
+        # Add topic information to mapping
+        mapping['kafka'] = {
+            'source_topic': source_topic,
+            'sink_topic': sink_topic,
+            'mapping_topic': mapping_topic
+        }
+            
+        # Deploy to Kafka
+        producer = Producer({
+            'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
+            'client.id': 'data_integration_deploy',
+            'acks': 'all',
+            'retries': 3,
+            'retry.backoff.ms': 1000,
+            'delivery.timeout.ms': 10000,
+            'request.timeout.ms': 5000
+        })
+        
+        # Send mapping configuration
+        producer.produce(
+            mapping_topic,
+            key=current.encode('utf-8'),
+            value=json.dumps(mapping).encode('utf-8')
+        )
+        producer.flush(timeout=10)
+            
+        # Update monitoring database
+        conn = sqlite3.connect('monitoring.db')
+        c = conn.cursor()
+        
+        # Store deployment information
+        c.execute('''INSERT OR REPLACE INTO deployed_rules 
+                    (rule_name, source_type, source_table, target_label, kafka_topic, status, last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?, datetime('now'))''',
+                (current, 
+                mapping['source']['type'],
+                mapping['source']['table'],
+                mapping['target']['label'],
+                json.dumps({
+                    'source': source_topic,
+                    'sink': sink_topic,
+                    'mapping': mapping_topic
+                }),
+                'Deployed'))
+
+        # Add initial monitoring entry
+        c.execute('''INSERT INTO integration_status 
+                    (timestamp, rule_name, records_processed, success_count, error_count)
+                    VALUES (datetime('now'), ?, 0, 0, 0)''',
+                (current,))
+        
+        conn.commit()
+        conn.close()
+        
+        # Refresh monitoring display
+        self.refresh_monitoring()
+            
+        # Show success message with topics
+        messagebox.showinfo("Success", 
+            f"Mapping rule '{current}' deployed successfully\n\n"
+            f"Created Topics:\n"
+            f"Source: {source_topic}\n"
+            f"Sink: {sink_topic}\n"
+            f"Mapping: {mapping_topic}")
+
+        # Verify deployment
+        self.verify_deployment(current, {
+            'source_topic': source_topic,
+            'sink_topic': sink_topic,
+            'mapping_topic': mapping_topic
+        })
+            
+    except Exception as e:
+        self.logger.error(f"Failed to deploy mapping rule: {str(e)}")
+        messagebox.showerror("Error", f"Failed to deploy mapping rule: {str(e)}")
+        return False
+
+    def verify_deployment(self, rule_name, topics):
+        """Verify deployment by checking topics and configurations"""
         try:
-            # Load mapping rule
-            mapping_file = f"mappings/{current}.json"
-            if not os.path.exists(mapping_file):
-                raise Exception("Mapping file not found")
-                
-            with open(mapping_file, 'r') as f:
-                mapping = json.load(f)
-                
-            # Deploy to Kafka
-            producer = Producer({
+            # Verify topics exist
+            admin_client = AdminClient({
                 'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get()
             })
             
-            topic = f"{self.kafka_entries['topic_prefix'].get()}_mappings"
-            producer.produce(
-                topic,
-                key=current.encode('utf-8'),
-                value=json.dumps(mapping).encode('utf-8')
-            )
-            producer.flush()
+            existing_topics = admin_client.list_topics().topics
+            missing_topics = []
             
-            messagebox.showinfo("Success", f"Mapping rule '{current}' deployed to Kafka")
+            for topic_type, topic_name in topics.items():
+                if topic_name not in existing_topics:
+                    missing_topics.append(f"{topic_type}: {topic_name}")
+            
+            if missing_topics:
+                raise Exception(f"Missing topics:\n" + "\n".join(missing_topics))
+                
+            # Verify mapping in database
+            conn = sqlite3.connect('monitoring.db')
+            c = conn.cursor()
+            
+            c.execute('''SELECT status FROM deployed_rules 
+                        WHERE rule_name = ? AND status = 'Deployed' ''', 
+                    (rule_name,))
+            
+            if not c.fetchone():
+                raise Exception("Rule not properly registered in monitoring database")
+                
+            conn.close()
+            
+            # Verify mapping in Kafka
+            consumer = Consumer({
+                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
+                'group.id': f"{self.kafka_entries['group_id'].get()}_verify",
+                'auto.offset.reset': 'earliest'
+            })
+            
+            consumer.subscribe([topics['mapping_topic']])
+            
+            # Try to find the mapping configuration
+            start_time = time.time()
+            mapping_found = False
+            
+            while time.time() - start_time < 5:  # 5 second timeout
+                msg = consumer.poll(timeout=1.0)
+                if msg and not msg.error():
+                    key = msg.key().decode('utf-8') if msg.key() else None
+                    if key == rule_name:
+                        mapping_found = True
+                        break
+                        
+            consumer.close()
+            
+            if not mapping_found:
+                raise Exception("Mapping configuration not found in Kafka")
+                
+            return True
             
         except Exception as e:
-            self.logger.error(f"Failed to deploy mapping rule: {str(e)}")
-            messagebox.showerror("Error", "Failed to deploy mapping rule")
+            self.logger.error(f"Deployment verification failed: {str(e)}")
+            messagebox.showerror("Verification Error", 
+                f"Deployment verification failed:\n{str(e)}")
+            return False
 
-
+    def monitor_topic_messages(self, topic_name):
+        """Show messages in a specific topic"""
+        try:
+            consumer = Consumer({
+                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
+                'group.id': f"{self.kafka_entries['group_id'].get()}_monitor",
+                'auto.offset.reset': 'earliest'
+            })
+            
+            consumer.subscribe([topic_name])
+            
+            messages_window = tk.Toplevel(self.root)
+            messages_window.title(f"Messages in {topic_name}")
+            messages_window.geometry("800x600")
+            
+            text = tk.Text(messages_window, wrap=tk.WORD)
+            text.pack(fill='both', expand=True, padx=10, pady=10)
+            
+            # Get last 10 messages
+            messages = []
+            while len(messages) < 10:
+                msg = consumer.poll(timeout=1.0)
+                if msg is None:
+                    break
+                if not msg.error():
+                    messages.append(msg)
+                    
+            for msg in messages:
+                text.insert('end', f"Offset: {msg.offset()}\n")
+                text.insert('end', f"Key: {msg.key().decode() if msg.key() else 'None'}\n")
+                text.insert('end', f"Value: {msg.value().decode()}\n")
+                text.insert('end', "-" * 80 + "\n\n")
+                
+            consumer.close()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to monitor topic: {str(e)}")
+            
     def check_deployment_status(self, rule_name):
         """Check deployment status of a specific rule"""
         try:
@@ -1254,81 +2661,80 @@ class DataIntegrationIDE:
         except Exception as e:
             self.logger.error(f"Failed to check deployment status: {str(e)}")
             return False
-            
+    
+
     def deploy_all_mappings(self):
         """Deploy all mapping rules to Kafka"""
         try:
             mapping_files = glob.glob('mappings/*.json')
             if not mapping_files:
-                self.logger.info("No mapping rules found to deploy")
                 messagebox.showinfo("Info", "No mapping rules found to deploy")
                 return
             
-            self.logger.info(f"Found {len(mapping_files)} mapping rules to deploy")
-            
+            # Check Kafka connection first
+            if not self.test_kafka_connection_silent():
+                messagebox.showerror("Error", "Kafka is not connected. Please check Kafka configuration.")
+                return
+
             producer = Producer({
                 'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get()
             })
             
             topic = f"{self.kafka_entries['topic_prefix'].get()}_mappings"
-            self.logger.info(f"Using Kafka topic: {topic}")
-            deployed_count = 0
+            deployed_rules = []
             
             for mapping_file in mapping_files:
                 rule_name = os.path.splitext(os.path.basename(mapping_file))[0]
-                self.logger.info(f"Deploying rule: {rule_name}")
-                
                 try:
                     with open(mapping_file, 'r') as f:
                         mapping = json.load(f)
-                    
-                    self.logger.info(f"Rule {rule_name} details:")
-                    self.logger.info(f"  Source: {mapping['source']['type']} - {mapping['source']['table']}")
-                    self.logger.info(f"  Target: {mapping['target']['label']}")
-                    self.logger.info(f"  Mapped columns: {len(mapping['columns'])}")
                     
                     producer.produce(
                         topic,
                         key=rule_name.encode('utf-8'),
                         value=json.dumps(mapping).encode('utf-8')
                     )
-                    deployed_count += 1
-                    self.logger.info(f"Successfully deployed rule: {rule_name}")
+                    deployed_rules.append(rule_name)
                     
                 except Exception as e:
                     self.logger.error(f"Failed to deploy rule '{rule_name}': {str(e)}")
-                    self.logger.error(f"Rule details: {mapping if 'mapping' in locals() else 'Not loaded'}")
                     
-            producer.flush()
-            self.logger.info(f"Producer flush completed")
-
-            # Add verification here, after the flush
-            if deployed_count > 0:
-                self.logger.info("Checking individual rule deployments...")
-                for mapping_file in mapping_files:
-                    rule_name = os.path.splitext(os.path.basename(mapping_file))[0]
-                    if self.check_deployment_status(rule_name):
-                        self.logger.info(f"Rule {rule_name} successfully verified")
-                    else:
-                        self.logger.warning(f"Rule {rule_name} verification failed")
+            # Wait for all messages to be delivered
+            producer.flush(timeout=10)
             
-            # Final status message
-            if deployed_count > 0:
-                success_msg = f"Successfully deployed {deployed_count} mapping rules to Kafka"
-                self.logger.info(success_msg)
-                messagebox.showinfo("Success", success_msg)
-                # Add this line to refresh monitoring
-                self.refresh_monitoring()
-            else:
-                warning_msg = "No mapping rules were deployed"
-                self.logger.warning(warning_msg)
-                messagebox.showwarning("Warning", warning_msg)
+            # Verify deployments and update monitoring database
+            conn = sqlite3.connect('monitoring.db')
+            c = conn.cursor()
+            
+            for rule_name in deployed_rules:
+                # Update deployed_rules table
+                c.execute('''INSERT OR REPLACE INTO deployed_rules 
+                            (rule_name, source_type, source_table, target_label, status, last_updated)
+                            VALUES (?, ?, ?, ?, ?, datetime('now'))''',
+                        (rule_name, 
+                        mapping['source']['type'],
+                        mapping['source']['table'],
+                        mapping['target']['label'],
+                        'Deployed'))
                 
+                # Add initial status entry
+                c.execute('''INSERT INTO integration_status 
+                            (timestamp, rule_name, records_processed, success_count, error_count)
+                            VALUES (datetime('now'), ?, 0, 0, 0)''',
+                        (rule_name,))
+            
+            conn.commit()
+            conn.close()
+
+            # Refresh monitoring display
+            self.refresh_monitoring()
+            
+            messagebox.showinfo("Success", f"Successfully deployed {len(deployed_rules)} mapping rules")
+            
         except Exception as e:
-            error_msg = f"Failed to deploy mapping rules: {str(e)}"
-            self.logger.error(error_msg)
-            self.logger.exception("Deployment error details:")
-            messagebox.showerror("Error", error_msg)
+            self.logger.error(f"Deployment failed: {str(e)}")
+            messagebox.showerror("Error", f"Failed to deploy mapping rules: {str(e)}")
+
 
     def show_rule_status(self):
         """Show detailed status of selected rule"""
@@ -1427,63 +2833,6 @@ class DataIntegrationIDE:
             self.logger.error(f"Failed to load mapping rules: {str(e)}")
             messagebox.showerror("Error", "Failed to load mapping rules")
 
-    def create_new_mapping(self):
-        """Create a new mapping rule"""
-        dialog = tk.Toplevel(self.root)
-        dialog.title("New Mapping Rule")
-        dialog.geometry("400x150")
-        
-        ttk.Label(dialog, text="Enter mapping rule name:").pack(pady=10)
-        
-        name_entry = ttk.Entry(dialog, width=40)
-        name_entry.pack(pady=5)
-        
-        def save_new():
-            name = name_entry.get().strip()
-            if name:
-                if name in self.mapping_rule_combo['values']:
-                    messagebox.showwarning("Warning", "A mapping rule with this name already exists")
-                    return
-                    
-                self.mapping_rule_var.set(name)
-                current_values = list(self.mapping_rule_combo['values'])
-                current_values.append(name)
-                self.mapping_rule_combo['values'] = current_values
-                self.clear_mapping_form()
-                dialog.destroy()
-            else:
-                messagebox.showwarning("Warning", "Please enter a name")
-        
-        ttk.Button(dialog, text="Create", command=save_new).pack(pady=10)
-
-    def delete_mapping(self):
-        """Delete selected mapping rule"""
-        current = self.mapping_rule_var.get()
-        if not current:
-            messagebox.showwarning("Warning", "Please select a mapping rule to delete")
-            return
-            
-        if messagebox.askyesno("Confirm Delete", 
-                            f"Are you sure you want to delete mapping rule '{current}'?"):
-            try:
-                # Delete mapping file
-                mapping_file = f"mappings/{current}.json"
-                if os.path.exists(mapping_file):
-                    os.remove(mapping_file)
-                
-                # Update combo box
-                values = list(self.mapping_rule_combo['values'])
-                values.remove(current)
-                self.mapping_rule_combo['values'] = values
-                self.mapping_rule_var.set('')
-                
-                # Clear form
-                self.clear_mapping_form()
-                
-            except Exception as e:
-                self.logger.error(f"Failed to delete mapping rule: {str(e)}")
-                messagebox.showerror("Error", "Failed to delete mapping rule")
-
     def clear_mapping_form(self):
         """Clear all mapping form fields"""
         self.source_table_var.set('')
@@ -1491,43 +2840,13 @@ class DataIntegrationIDE:
         self.mapped_columns.delete(*self.mapped_columns.get_children())
         self.source_columns.delete(*self.source_columns.get_children())
 
-        
-    def load_selected_mapping(self, event=None):
-        """Load selected mapping rule"""
-        current = self.mapping_rule_var.get()
-        if not current:
-            return
-            
-        try:
-            mapping_file = f"mappings/{current}.json"
-            if os.path.exists(mapping_file):
-                with open(mapping_file, 'r') as f:
-                    mapping = json.load(f)
-                    
-                # Update form with mapping data
-                self.source_table_var.set(mapping['source']['table'])
-                self.target_label_entry.delete(0, tk.END)
-                self.target_label_entry.insert(0, mapping['target']['label'])
-                
-                # Clear existing mappings
-                self.mapped_columns.delete(*self.mapped_columns.get_children())
-                
-                # Load mapped columns
-                for source_col, target_col in mapping['columns'].items():
-                    self.mapped_columns.insert('', 'end', values=(source_col, target_col))
-                    
-                # Load source fields for the selected table
-                self.load_source_fields()
-                
-        except Exception as e:
-            self.logger.error(f"Failed to load mapping rule: {str(e)}")
-            messagebox.showerror("Error", "Failed to load mapping rule")
-
-
     def on_source_type_changed(self, *args):
         """Handle source type change"""
-        self.load_source_tables()  # Reload tables/collections based on new source type
-
+        # Reset connection state
+        self.source_table_combo['state'] = 'disabled'
+        self.source_table_combo['values'] = []
+        self.source_table_var.set('')
+        self.update_connection_status("source", False)
         
     def check_source_connection(self):
         """Check if source database is connected"""
@@ -1698,680 +3017,38 @@ class DataIntegrationIDE:
             return False
 
 
-    def deploy_to_kafka(self):
-        """Deploy mapping rules to Kafka"""
-        producer = None
+    def load_source_tables(self):
+        """Load available tables/collections from source database"""
         try:
-            # First, do a comprehensive Kafka check
-            if not self.test_kafka_connection_silent():
-                raise Exception("Kafka connection failed")
-
-            # Save and load mapping rules
-            self.save_mappings()
-            with open('mapping_rules.json', 'r') as f:
-                mappings = json.load(f)
-
-            # Validate mappings
-            if not mappings.get('columns'):
-                raise Exception("No columns mapped. Please map columns before deploying.")
-
-            # Create producer with robust configuration
-            producer_config = {
-                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
-                'client.id': 'data_integration_deploy',
-                'acks': 'all',
-                'retries': 3,
-                'retry.backoff.ms': 1000,
-                'delivery.timeout.ms': 10000,
-                'request.timeout.ms': 5000
-            }
-
-            topic = f"{self.kafka_entries['topic_prefix'].get()}_mappings"
-            producer = Producer(producer_config)
-
-            # Send mapping rules
-            try:
-                producer.produce(
-                    topic,
-                    key=f"{mappings['source']['table']}".encode('utf-8'),
-                    value=json.dumps(mappings).encode('utf-8')
-                )
+            tables = []
+            if self.source_var.get() == "postgresql":
+                import psycopg2
+                config = {key: entry.get() for key, entry in self.pg_entries.items()}
+                conn = psycopg2.connect(**config)
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT table_name 
+                    FROM information_schema.tables 
+                    WHERE table_schema = 'public'
+                    ORDER BY table_name
+                """)
+                tables = [row[0] for row in cursor.fetchall()]
+                conn.close()
                 
-                # Wait for delivery
-                remaining = producer.flush(timeout=5)
-                if remaining > 0:
-                    raise Exception(f"Failed to flush all messages. {remaining} messages remaining.")
+            elif self.source_var.get() == "mongodb":
+                from pymongo import MongoClient
+                config = {key: entry.get() for key, entry in self.mongo_entries.items()}
+                client = MongoClient(f"mongodb://{config['host']}:{config['port']}/")
+                db = client[config['database']]
+                tables = sorted(db.list_collection_names())
+                client.close()
 
-                # Verify the deployment
-                if self.verify_kafka_mapping():
-                    messagebox.showinfo("Success", 
-                        f"Mapping rules deployed successfully\n"
-                        f"Topic: {topic}\n"
-                        f"Source: {mappings['source']['table']}\n"
-                        f"Target: {mappings['target']['label']}")
-                else:
-                    raise Exception("Failed to verify mapping deployment")
-
-            except Exception as e:
-                raise Exception(f"Failed to send mapping rules: {str(e)}")
-
-        except Exception as e:
-            self.logger.error(f"Deployment failed: {str(e)}")
-            messagebox.showerror("Deployment Error", 
-                "Failed to deploy mapping rules:\n"
-                f"Kafka is not connected. Please check your Kafka configuration and connection.\n\n"
-                "Please check:\n"
-                "1. Kafka connection\n"
-                "2. Topic permissions\n"
-                "3. Mapping configuration")
-        finally:
-            # Clean up producer
-            if producer is not None:
-                producer.flush()  # Final flush
-                del producer  # Properly delete the producer instance
-
-    def test_kafka_connection_silent(self):
-        """Test Kafka connection without showing messages"""
-        producer = None
-        try:
-            bootstrap_servers = self.kafka_entries['bootstrap_servers'].get()
-            producer = Producer({
-                'bootstrap.servers': bootstrap_servers,
-                'socket.timeout.ms': 5000
-            })
-            producer.flush(timeout=5)
-            return True
-        except:
-            return False
-        finally:
-            if producer is not None:
-                producer.flush()
-                del producer
-
-    def verify_kafka_mapping(self):
-        """Verify the mapping was properly deployed"""
-        consumer = None
-        try:
-            consumer = Consumer({
-                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
-                'group.id': f"{self.kafka_entries['group_id'].get()}_verify",
-                'auto.offset.reset': 'earliest',
-                'session.timeout.ms': 6000,
-            })
-
-            topic = f"{self.kafka_entries['topic_prefix'].get()}_mappings"
-            consumer.subscribe([topic])
-
-            # Try multiple times with timeout
-            for _ in range(3):
-                msg = consumer.poll(timeout=2.0)
-                if msg and not msg.error():
-                    return True
-
-            return False
-
-        except Exception as e:
-            self.logger.error(f"Verification failed: {str(e)}")
-            return False
-
-        finally:
-            if consumer is not None:
-                try:
-                    consumer.close()
-                except:
-                    pass
-
-
-    def show_deployment_success(self, verification):
-        """Show successful deployment status"""
-        status_msg = (
-            f"✓ Mapping rules deployed successfully\n\n"
-            f"Topic: {verification['topic']}\n"
-            f"Source: {verification['source_table']}\n"
-            f"Target: {verification['target_label']}\n"
-            f"Mapped Columns: {verification['column_count']}\n"
-            f"Timestamp: {datetime.fromtimestamp(verification['timestamp']/1000).strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        
-        # Create status window
-        status_window = tk.Toplevel(self.root)
-        status_window.title("Deployment Status")
-        status_window.geometry("500x400")
-        
-        # Add status icon
-        success_label = ttk.Label(status_window, text="✓", font=('TkDefaultFont', 48), foreground='green')
-        success_label.pack(pady=10)
-        
-        # Status details
-        text_widget = tk.Text(status_window, wrap=tk.WORD, padx=20, pady=10)
-        text_widget.pack(fill='both', expand=True)
-        text_widget.insert('1.0', status_msg)
-        text_widget.configure(state='disabled')
-        
-        # Verification buttons
-        button_frame = ttk.Frame(status_window)
-        button_frame.pack(pady=10)
-        
-        ttk.Button(button_frame, text="Check Topic Status", 
-                command=lambda: self.show_topic_status(verification['topic'])).pack(side='left', padx=5)
-        
-        ttk.Button(button_frame, text="View Messages", 
-                command=lambda: self.show_topic_messages(verification['topic'])).pack(side='left', padx=5)
-        
-
-    def show_topic_status(self, topic):
-        """Show detailed topic status"""
-        try:
-            from confluent_kafka.admin import AdminClient
-            
-            admin = AdminClient({
-                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get()
-            })
-            
-            # Get topic metadata
-            metadata = admin.list_topics(timeout=10)
-            topic_metadata = metadata.topics[topic]
-            
-            status_msg = (
-                f"Topic: {topic}\n"
-                f"Partitions: {len(topic_metadata.partitions)}\n"
-                f"State: {'Active' if not topic_metadata.error else 'Error'}\n"
-            )
-            
-            messagebox.showinfo("Topic Status", status_msg)
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to get topic status: {str(e)}")
-
-    def show_topic_messages(self, topic):
-        """Show recent messages in topic"""
-        try:
-            consumer = Consumer({
-                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
-                'group.id': f"{self.kafka_entries['group_id'].get()}_view",
-                'auto.offset.reset': 'earliest'
-            })
-            
-            consumer.subscribe([topic])
-            
-            # Create message viewer window
-            viewer = tk.Toplevel(self.root)
-            viewer.title(f"Messages in {topic}")
-            viewer.geometry("600x400")
-            
-            # Message display
-            text_widget = tk.Text(viewer, wrap=tk.WORD, padx=10, pady=10)
-            text_widget.pack(fill='both', expand=True)
-            
-            # Get messages (last 10)
-            messages = []
-            while len(messages) < 10:
-                msg = consumer.poll(timeout=1.0)
-                if msg is None:
-                    break
-                if not msg.error():
-                    messages.append({
-                        'timestamp': msg.timestamp()[1],
-                        'key': msg.key().decode('utf-8') if msg.key() else None,
-                        'value': json.loads(msg.value().decode('utf-8'))
-                    })
-            
-            if messages:
-                for msg in messages:
-                    text_widget.insert('end', 
-                        f"Timestamp: {msg['timestamp']}\n"
-                        f"Key: {msg['key']}\n"
-                        f"Value: {json.dumps(msg['value'], indent=2)}\n"
-                        f"{'-'*60}\n\n"
-                    )
-            else:
-                text_widget.insert('end', "No messages found in topic")
-            
-            consumer.close()
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to read topic messages: {str(e)}")
-
-    def create_monitoring(self):
-        frame = ttk.Frame(self.notebook)
-        
-        # SQLite monitoring setup
-        monitor_frame = ttk.LabelFrame(frame, text="Monitoring Dashboard")
-        monitor_frame.pack(pady=10, padx=10, fill="both", expand=True)
-        
-        # Status display
-        self.status_tree = ttk.Treeview(monitor_frame, 
-                                    columns=("timestamp", "status", "records"))
-        self.status_tree.heading("timestamp", text="Timestamp")
-        self.status_tree.heading("status", text="Status")
-        self.status_tree.heading("records", text="Records Processed")
-        
-        # Add auto-refresh
-        refresh_frame = ttk.Frame(frame)
-        refresh_frame.pack(fill='x', padx=10, pady=5)
-        
-        self.auto_refresh_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(refresh_frame, text="Auto Refresh", 
-                        variable=self.auto_refresh_var).pack(side='left')
-        
-        ttk.Button(refresh_frame, text="Refresh Now", 
-                command=self.refresh_monitoring).pack(side='right')
-        
-        # Start auto-refresh
-        self.start_auto_refresh()
-        
-        return frame
-
-    def start_auto_refresh(self):
-        """Start auto-refresh for monitoring"""
-        def refresh_loop():
-            if self.auto_refresh_var.get():
-                self.refresh_monitoring()
-            self.root.after(5000, refresh_loop)  # Refresh every 5 seconds
-        
-        refresh_loop()
-        
-    def setup_kafka_config(self):
-        """Initialize Kafka configuration"""
-        self.kafka_config = {
-            'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
-            'client.id': 'data_integration_client',
-            'group.id': self.kafka_entries['group_id'].get(),
-            'auto.offset.reset': self.auto_offset.get(),
-            'socket.timeout.ms': 10000
-        }
-
-
-    def run_integration(self):
-        # Initialize SQLite monitoring database
-        self.init_monitoring_db()
-        
-        # Start Kafka consumers and producers
-        self.start_kafka_streaming()
-        
-        # Begin monitoring
-        self.start_monitoring()
-
-    def init_monitoring_db(self):
-        """Initialize SQLite database for monitoring"""
-        try:
-            conn = sqlite3.connect('monitoring.db')
-            c = conn.cursor()
-            
-            # Create tables if they don't exist
-            c.execute('''CREATE TABLE IF NOT EXISTS integration_status
-                        (timestamp TEXT,
-                        rule_name TEXT,
-                        records_processed INTEGER,
-                        success_count INTEGER,
-                        error_count INTEGER)''')
-            
-            c.execute('''CREATE TABLE IF NOT EXISTS deployed_rules
-                        (rule_name TEXT PRIMARY KEY,
-                        source_type TEXT,
-                        source_table TEXT,
-                        target_label TEXT,
-                        status TEXT,
-                        last_updated TEXT)''')
-            
-            conn.commit()
-            conn.close()
-            self.logger.info("Monitoring database initialized successfully")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to initialize monitoring database: {str(e)}")
-            messagebox.showerror("Error", "Failed to initialize monitoring database")
-
-    def create_monitoring(self):
-        frame = ttk.Frame(self.notebook)
-        
-        # Create main layout with two panes
-        paned = ttk.PanedWindow(frame, orient='vertical')
-        paned.pack(fill='both', expand=True, padx=10, pady=10)
-        
-        # Top frame for deployed rules
-        rules_frame = ttk.LabelFrame(paned, text="Deployed Mapping Rules")
-        paned.add(rules_frame)
-        
-        # Rules Treeview
-        self.rules_tree = ttk.Treeview(rules_frame, 
-                                    columns=("rule", "source", "target", "status"),
-                                    show='headings',
-                                    height=6)
-        self.rules_tree.heading("rule", text="Rule Name")
-        self.rules_tree.heading("source", text="Source")
-        self.rules_tree.heading("target", text="Target")
-        self.rules_tree.heading("status", text="Status")
-        
-        self.rules_tree.column("rule", width=150)
-        self.rules_tree.column("source", width=200)
-        self.rules_tree.column("target", width=200)
-        self.rules_tree.column("status", width=100)
-        
-        # Add scrollbar to rules tree
-        rules_scroll = ttk.Scrollbar(rules_frame, orient="vertical", command=self.rules_tree.yview)
-        self.rules_tree.configure(yscrollcommand=rules_scroll.set)
-        
-        self.rules_tree.pack(side='left', fill='both', expand=True)
-        rules_scroll.pack(side='right', fill='y')
-        
-        # Bottom frame for sync status
-        status_frame = ttk.LabelFrame(paned, text="Synchronization Status")
-        paned.add(status_frame)
-        
-        # Status Treeview
-        self.status_tree = ttk.Treeview(status_frame, 
-                                    columns=("timestamp", "rule", "records", "success", "errors"),
-                                    show='headings',
-                                    height=8)
-        self.status_tree.heading("timestamp", text="Timestamp")
-        self.status_tree.heading("rule", text="Rule Name")
-        self.status_tree.heading("records", text="Records Processed")
-        self.status_tree.heading("success", text="Success Count")
-        self.status_tree.heading("errors", text="Error Count")
-        
-        self.status_tree.column("timestamp", width=150)
-        self.status_tree.column("rule", width=150)
-        self.status_tree.column("records", width=100)
-        self.status_tree.column("success", width=100)
-        self.status_tree.column("errors", width=100)
-        
-        # Add scrollbar to status tree
-        status_scroll = ttk.Scrollbar(status_frame, orient="vertical", command=self.status_tree.yview)
-        self.status_tree.configure(yscrollcommand=status_scroll.set)
-        
-        self.status_tree.pack(side='left', fill='both', expand=True)
-        status_scroll.pack(side='right', fill='y')
-        
-        # Control frame
-        control_frame = ttk.Frame(frame)
-        control_frame.pack(fill='x', padx=10, pady=5)
-        
-        # Add control buttons
-        ttk.Button(control_frame, text="Refresh Status", 
-                command=self.refresh_monitoring).pack(side='left', padx=5)
-        ttk.Button(control_frame, text="View Details", 
-                command=self.show_sync_details).pack(side='left', padx=5)
-        ttk.Button(control_frame, text="Start Monitoring", 
-                command=self.start_monitoring).pack(side='right', padx=5)
-        ttk.Button(control_frame, text="Stop Monitoring", 
-                command=self.stop_monitoring).pack(side='right', padx=5)
-        
-        # Status bar
-        status_bar = ttk.Frame(frame)
-        status_bar.pack(fill='x', padx=10, pady=5)
-        
-        # Kafka status indicators
-        self.source_status = ttk.Label(status_bar, text="Source: Not Connected")
-        self.source_status.pack(side='left', padx=10)
-        self.sink_status = ttk.Label(status_bar, text="Sink: Not Connected")
-        self.sink_status.pack(side='left', padx=10)
-        
-        # Initialize monitoring
-        self.monitoring_active = False
-        self.update_monitoring_status()
-        
-        return frame
-
-    def refresh_monitoring(self):
-        """Refresh monitoring data"""
-        try:
-            # Clear existing items
-            self.rules_tree.delete(*self.rules_tree.get_children())
-            
-            # Load rules from mappings directory
-            mapping_files = glob.glob('mappings/*.json')
-            for mapping_file in mapping_files:
-                try:
-                    rule_name = os.path.splitext(os.path.basename(mapping_file))[0]
-                    with open(mapping_file, 'r') as f:
-                        mapping = json.load(f)
-                        
-                    source = f"{mapping['source']['type']} - {mapping['source']['table']}"
-                    target = f"Neo4j - {mapping['target']['label']}"
-                    
-                    # Check if rule is deployed to Kafka
-                    status = "Deployed" if self.check_rule_deployment(rule_name) else "Not Deployed"
-                    
-                    self.rules_tree.insert('', 'end', values=(
-                        rule_name,
-                        source,
-                        target,
-                        status
-                    ))
-                    
-                except Exception as e:
-                    self.logger.error(f"Error loading rule {rule_name}: {str(e)}")
-                    
-            # Update status tree
-            self.update_status_tree()
-            
-        except Exception as e:
-            self.logger.error(f"Failed to refresh monitoring: {str(e)}")
-            messagebox.showerror("Error", "Failed to refresh monitoring data")
-
-    def check_rule_deployment(self, rule_name):
-        """Check if a rule is deployed to Kafka"""
-        try:
-            consumer = Consumer({
-                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
-                'group.id': f"{self.kafka_entries['group_id'].get()}_check",
-                'auto.offset.reset': 'earliest'
-            })
-            
-            topic = f"{self.kafka_entries['topic_prefix'].get()}_mappings"
-            consumer.subscribe([topic])
-            
-            # Try to find the rule in topic
-            found = False
-            start_time = time.time()
-            while time.time() - start_time < 2:  # 2 second timeout
-                msg = consumer.poll(timeout=1.0)
-                if msg is None:
-                    continue
-                    
-                if msg.error():
-                    continue
-                    
-                try:
-                    key = msg.key().decode('utf-8')
-                    if key == rule_name:
-                        found = True
-                        break
-                except:
-                    continue
-                    
-            consumer.close()
-            return found
-            
-        except Exception as e:
-            self.logger.error(f"Failed to check rule deployment: {str(e)}")
-            return False
-        
-
-    def check_database_status(self):
-        """Check if monitoring database is properly initialized"""
-        try:
-            conn = sqlite3.connect('monitoring.db')
-            c = conn.cursor()
-            
-            # Check if tables exist
-            c.execute("""SELECT name FROM sqlite_master 
-                        WHERE type='table' AND 
-                        name IN ('integration_status', 'deployed_rules')""")
-            
-            existing_tables = set(row[0] for row in c.fetchall())
-            required_tables = {'integration_status', 'deployed_rules'}
-            
-            conn.close()
-            
-            if not required_tables.issubset(existing_tables):
-                self.logger.info("Reinitializing monitoring database")
-                self.init_monitoring_db()
+            return tables
                 
-            return True
-            
         except Exception as e:
-            self.logger.error(f"Database status check failed: {str(e)}")
-            return False
-        
-        
-    def update_status_tree(self):
-        """Update status tree with recent sync results"""
-        try:
-            # Ensure database exists
-            self.init_monitoring_db()
-            
-            # Clear existing items
-            self.status_tree.delete(*self.status_tree.get_children())
-            
-            # Load status from SQLite
-            conn = sqlite3.connect('monitoring.db')
-            c = conn.cursor()
-            
-            # Get recent status entries
-            c.execute('''SELECT timestamp, rule_name, records_processed, 
-                            success_count, error_count 
-                        FROM integration_status 
-                        ORDER BY timestamp DESC LIMIT 100''')
-            
-            rows = c.fetchall()
-            
-            if not rows:
-                # Add placeholder text if no data
-                self.status_tree.insert('', 'end', values=(
-                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'No Data',
-                    0,
-                    0,
-                    0
-                ))
-            else:
-                for row in rows:
-                    self.status_tree.insert('', 'end', values=row)
-                
-            conn.close()
-            
-        except sqlite3.OperationalError as e:
-            self.logger.error(f"Database error: {str(e)}")
-            self.init_monitoring_db()  # Try to reinitialize the database
-            
-        except Exception as e:
-            self.logger.error(f"Failed to update status tree: {str(e)}")
-
-    def start_monitoring(self):
-        """Start monitoring Kafka topics"""
-        if not self.monitoring_active:
-            # Check database status before starting
-            if not self.check_database_status():
-                messagebox.showerror("Error", "Failed to initialize monitoring database")
-                return
-                
-            self.monitoring_active = True
-            self.monitor_thread = threading.Thread(target=self.monitor_kafka_topics, daemon=True)
-            self.monitor_thread.start()
-            self.update_monitoring_status()
-
-    def stop_monitoring(self):
-        """Stop monitoring Kafka topics"""
-        self.monitoring_active = False
-        self.update_monitoring_status()
-
-    def update_monitoring_status(self):
-        """Update monitoring status indicators"""
-        if self.monitoring_active:
-            self.source_status.config(text="Source: Connected", foreground='green')
-            self.sink_status.config(text="Sink: Connected", foreground='green')
-        else:
-            self.source_status.config(text="Source: Not Connected", foreground='red')
-            self.sink_status.config(text="Sink: Not Connected", foreground='red')
-
-    def monitor_kafka_topics(self):
-        """Background thread to monitor Kafka topics"""
-        try:
-            consumer = Consumer({
-                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
-                'group.id': f"{self.kafka_entries['group_id'].get()}_monitor",
-                'auto.offset.reset': 'latest'
-            })
-            
-            # Subscribe to source and sink topics
-            source_topic = f"{self.kafka_entries['topic_prefix'].get()}_source"
-            sink_topic = f"{self.kafka_entries['topic_prefix'].get()}_sink"
-            consumer.subscribe([source_topic, sink_topic])
-            
-            while self.monitoring_active:
-                msg = consumer.poll(timeout=1.0)
-                if msg is None:
-                    continue
-                    
-                if msg.error():
-                    continue
-                    
-                # Process message and update status
-                try:
-                    data = json.loads(msg.value().decode('utf-8'))
-                    self.update_sync_status(msg.topic(), data)
-                except:
-                    continue
-                    
-            consumer.close()
-            
-        except Exception as e:
-            self.logger.error(f"Monitoring error: {str(e)}")
-            self.monitoring_active = False
-            self.update_monitoring_status()
-
-    def update_sync_status(self, topic, data):
-        """Update sync status in database"""
-        try:
-            conn = sqlite3.connect('monitoring.db')
-            c = conn.cursor()
-            
-            c.execute('''INSERT INTO integration_status 
-                        (timestamp, rule_name, records_processed, success_count, error_count)
-                        VALUES (datetime('now'), ?, ?, ?, ?)''',
-                    (data.get('rule_name', 'Unknown'),
-                    data.get('records_processed', 0),
-                    data.get('success_count', 0),
-                    data.get('error_count', 0)))
-            
-            conn.commit()
-            conn.close()
-            
-            # Update UI in main thread
-            self.root.after(0, self.update_status_tree)
-            
-        except Exception as e:
-            self.logger.error(f"Failed to update sync status: {str(e)}")
-
-    def show_sync_details(self):
-        """Show detailed sync information"""
-        selected = self.status_tree.selection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please select a status entry to view details")
-            return
-            
-        # Get selected status
-        values = self.status_tree.item(selected[0])['values']
-        
-        # Create details window
-        details = tk.Toplevel(self.root)
-        details.title("Sync Details")
-        details.geometry("500x400")
-        
-        # Add details
-        text = tk.Text(details, wrap=tk.WORD, padx=10, pady=10)
-        text.pack(fill='both', expand=True)
-        
-        text.insert('end', f"Timestamp: {values[0]}\n")
-        text.insert('end', f"Rule Name: {values[1]}\n")
-        text.insert('end', f"Records Processed: {values[2]}\n")
-        text.insert('end', f"Success Count: {values[3]}\n")
-        text.insert('end', f"Error Count: {values[4]}\n")
-        
-        text.configure(state='disabled')
-        
+            self.logger.error(f"Failed to load source tables: {str(e)}")
+            return []
+      
 
 if __name__ == "__main__":
     app = DataIntegrationIDE()
