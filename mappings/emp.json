@@ -1,0 +1,16 @@
+{
+  "source": {
+    "type": "postgresql",
+    "table": "emp"
+  },
+  "target": {
+    "type": "node",
+    "label": "Emp"
+  },
+  "columns": {
+    "id": "id",
+    "salary": "salary",
+    "name": "name",
+    "department": "department"
+  }
+}
