@@ -350,36 +350,31 @@ class DataIntegrationIDE:
 
 
     def update_connection_status(self, connection_type, is_connected, db_type=None):
-        color = "#2ECC71" if is_connected else "#95A5A6"
+        color = "#2ECC71" if is_connected else "#95A5A6"  # Green if connected, gray if not
+        text_color = "#2ECC71" if is_connected else "#95A5A6"  # Same colors for text
         
         if connection_type == "source":
             self.source_indicator.delete("all")
             self.source_indicator.create_oval(2, 2, 10, 10, fill=color, outline=color)
             if db_type:
-                self.source_type_label.config(text=f"{db_type}")
+                self.source_type_label.config(text=f"{db_type}", foreground=text_color)
             else:
-                self.source_type_label.config(text="Disconnected")
+                self.source_type_label.config(text="Disconnected", foreground=text_color)
         elif connection_type == "target":
             self.target_indicator.delete("all")
             self.target_indicator.create_oval(2, 2, 10, 10, fill=color, outline=color)
             if db_type:
-                self.target_type_label.config(text=f"{db_type}")
+                self.target_type_label.config(text=f"{db_type}", foreground=text_color)
             else:
-                self.target_type_label.config(text="Disconnected")
+                self.target_type_label.config(text="Disconnected", foreground=text_color)
         elif connection_type == "kafka":
             self.kafka_indicator.delete("all")
             self.kafka_indicator.create_oval(2, 2, 10, 10, fill=color, outline=color)
             if db_type:
-                self.kafka_type_label.config(
-                    text=f"{db_type}",
-                    foreground=color
-                )
+                self.kafka_type_label.config(text=f"{db_type}", foreground=text_color)
             else:
-                self.kafka_type_label.config(
-                    text="Disconnected",
-                    foreground=color
-                )
-
+                self.kafka_type_label.config(text="Disconnected", foreground=text_color)
+                
     def validate_kafka_config(self):
         """Validate Kafka configuration"""
         required_fields = [
@@ -896,7 +891,8 @@ class DataIntegrationIDE:
             
         except Exception as e:
             messagebox.showerror("Error", f"Failed to read topic messages: {str(e)}")
-      
+
+
     def create_monitoring(self):
         frame = ttk.Frame(self.notebook)
         
@@ -908,7 +904,7 @@ class DataIntegrationIDE:
         rules_frame = ttk.LabelFrame(paned, text="Deployed Mapping Rules")
         paned.add(rules_frame)
         
-        # Rules Treeview - Add topic column
+        # Rules Treeview
         self.rules_tree = ttk.Treeview(rules_frame, 
                                     columns=("rule", "source", "target", "topic", "status"),
                                     show='headings',
@@ -916,19 +912,14 @@ class DataIntegrationIDE:
         self.rules_tree.heading("rule", text="Rule Name")
         self.rules_tree.heading("source", text="Source")
         self.rules_tree.heading("target", text="Target")
-        self.rules_tree.heading("topic", text="Kafka Topic")  # New column
+        self.rules_tree.heading("topic", text="Kafka Topic")
         self.rules_tree.heading("status", text="Status")
-        
-        self.rules_tree.column("rule", width=150)
-        self.rules_tree.column("source", width=150)
-        self.rules_tree.column("target", width=150)
-        self.rules_tree.column("topic", width=150)  # New column
-        self.rules_tree.column("status", width=100)
         
         # Add scrollbar to rules tree
         rules_scroll = ttk.Scrollbar(rules_frame, orient="vertical", command=self.rules_tree.yview)
         self.rules_tree.configure(yscrollcommand=rules_scroll.set)
         
+        # Pack rules tree and scrollbar
         self.rules_tree.pack(side='left', fill='both', expand=True)
         rules_scroll.pack(side='right', fill='y')
         
@@ -947,16 +938,11 @@ class DataIntegrationIDE:
         self.status_tree.heading("success", text="Success Count")
         self.status_tree.heading("errors", text="Error Count")
         
-        self.status_tree.column("timestamp", width=150)
-        self.status_tree.column("rule", width=150)
-        self.status_tree.column("records", width=100)
-        self.status_tree.column("success", width=100)
-        self.status_tree.column("errors", width=100)
-        
         # Add scrollbar to status tree
         status_scroll = ttk.Scrollbar(status_frame, orient="vertical", command=self.status_tree.yview)
         self.status_tree.configure(yscrollcommand=status_scroll.set)
         
+        # Pack status tree and scrollbar  
         self.status_tree.pack(side='left', fill='both', expand=True)
         status_scroll.pack(side='right', fill='y')
 
@@ -964,110 +950,19 @@ class DataIntegrationIDE:
         control_frame = ttk.Frame(frame)
         control_frame.pack(fill='x', padx=10, pady=5)
 
-        # Left side buttons
-        left_buttons_frame = ttk.Frame(control_frame)
-        left_buttons_frame.pack(side='left')
-
-        # Left side buttons
-        ttk.Button(left_buttons_frame, text="Refresh Status", 
+        # Buttons
+        ttk.Button(control_frame, text="Refresh Status", 
                 command=self.refresh_monitoring).pack(side='left', padx=5)
-        ttk.Button(left_buttons_frame, text="View Details", 
-                command=self.show_sync_details).pack(side='left', padx=5)
-        ttk.Button(left_buttons_frame, text="View Action History", 
-                command=self.show_action_history).pack(side='left', padx=5)
-        ttk.Button(left_buttons_frame, text="Diagnostic Check", 
-                command=lambda: messagebox.showinfo(
-                    "System Check", 
-                    self.test_complete_workflow()
+        ttk.Button(control_frame, text="Show Topics",
+                command=lambda: self.show_rule_topics(
+                    self.rules_tree.item(self.rules_tree.selection()[0])['values'][0]
+                    if self.rules_tree.selection() else None
                 )).pack(side='left', padx=5)
-        
-
-        # Right side buttons
-        right_buttons_frame = ttk.Frame(control_frame)
-        right_buttons_frame.pack(side='right')
-        
-        ttk.Button(right_buttons_frame, text="Verify Sync", 
-                command=self.verify_data_sync).pack(side='left', padx=5)
-        ttk.Button(right_buttons_frame, text="Start Monitoring", 
-                command=self.start_monitoring).pack(side='left', padx=5)
-        ttk.Button(right_buttons_frame, text="Stop Monitoring", 
-                command=self.stop_monitoring).pack(side='left', padx=5)
-
-        # Status bar and remaining setup
-        status_bar = ttk.Frame(frame)
-        status_bar.pack(fill='x', padx=10, pady=5)
-        
-    
-        # Add to control_frame in create_monitoring
-        ttk.Button(control_frame, text="Diagnostic Check", 
-                command=lambda: messagebox.showinfo(
-                    "System Check", 
-                    self.test_complete_workflow()
-                )).pack(side='left', padx=5)
-        
-        # Left side buttons
-        left_buttons_frame = ttk.Frame(control_frame)
-        left_buttons_frame.pack(side='left')
-        
-        ttk.Button(left_buttons_frame, text="Refresh Status", 
-                command=self.refresh_monitoring).pack(side='left', padx=5)
-        ttk.Button(left_buttons_frame, text="View Details", 
-                command=self.show_sync_details).pack(side='left', padx=5)
-        # Add Action History button here
-        ttk.Button(left_buttons_frame, text="View Action History", 
+        ttk.Button(control_frame, text="View Action History", 
                 command=self.show_action_history).pack(side='left', padx=5)
-        
-        # Right side buttons
-        right_buttons_frame = ttk.Frame(control_frame)
-        right_buttons_frame.pack(side='right')
-        
-        ttk.Button(right_buttons_frame, text="Verify Sync", 
-                command=self.verify_data_sync).pack(side='left', padx=5)
-        ttk.Button(right_buttons_frame, text="Start Monitoring", 
-                command=self.start_monitoring).pack(side='left', padx=5)
-        ttk.Button(right_buttons_frame, text="Stop Monitoring", 
-                command=self.stop_monitoring).pack(side='left', padx=5)
-             
-        # Additional buttons in rules_actions frame
-        ttk.Button(rules_actions, text="View Details", 
-                command=self.show_sync_details).pack(side='left', padx=5)
-        
-        ttk.Button(rules_actions, text="Refresh Rules", 
-                command=self.refresh_monitoring).pack(side='left', padx=5)
-        
-    
-        # Status bar
-        status_bar = ttk.Frame(frame)
-        status_bar.pack(fill='x', padx=10, pady=5)
-        
-        # Connection status indicators frame
-        conn_status_frame = ttk.Frame(status_bar)
-        conn_status_frame.pack(side='left')
-        
-        # Source status with icon
-        source_frame = ttk.Frame(conn_status_frame)
-        source_frame.pack(side='left', padx=10)
-        self.source_status = ttk.Label(source_frame, text="Source: Not Connected")
-        self.source_status.pack(side='left')
-        self.source_indicator = tk.Canvas(source_frame, width=12, height=12)
-        self.source_indicator.pack(side='left', padx=5)
-        
-        # Sink status with icon
-        sink_frame = ttk.Frame(conn_status_frame)
-        sink_frame.pack(side='left', padx=10)
-        self.sink_status = ttk.Label(sink_frame, text="Sink: Not Connected")
-        self.sink_status.pack(side='left')
-        self.sink_indicator = tk.Canvas(sink_frame, width=12, height=12)
-        self.sink_indicator.pack(side='left', padx=5)
-        
-        # Initialize monitoring state
-        self.monitoring_active = False
-        self.update_monitoring_status()
-        
-        # Update initial status indicators
-        self.update_connection_indicators()
-        
+
         return frame
+
 
     def start_auto_refresh(self):
         """Start auto-refresh for monitoring"""
@@ -1251,7 +1146,6 @@ class DataIntegrationIDE:
             self.logger.error(f"Failed to get topics for rule {rule_name}: {str(e)}")
             return None
         
-        
     def refresh_monitoring(self):
         """Refresh monitoring data"""
         try:
@@ -1262,10 +1156,12 @@ class DataIntegrationIDE:
             conn = sqlite3.connect('monitoring.db')
             c = conn.cursor()
             
-            # Get deployed rules
+            # Get deployed rules from database
             c.execute('''SELECT rule_name, source_type, source_table, 
                         target_label, status, kafka_topic
-                        FROM deployed_rules''')
+                        FROM deployed_rules
+                        WHERE status = 'Deployed'
+                        ORDER BY last_updated DESC''')
             
             deployed_rules = c.fetchall()
             
@@ -1297,21 +1193,13 @@ class DataIntegrationIDE:
                             rule[0],
                             0, 0, 0
                         ))
-            else:
-                # No deployed rules
-                self.status_tree.insert('', 'end', values=(
-                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'No Data',
-                    0, 0, 0
-                ))
-                
+                        
             conn.close()
             
         except Exception as e:
             self.logger.error(f"Failed to refresh monitoring: {str(e)}")
             messagebox.showerror("Error", "Failed to refresh monitoring data")
-
-
+            
     def check_rule_deployment(self, rule_name):
         """Check if a rule is deployed to Kafka and monitoring database"""
         try:
@@ -1551,40 +1439,6 @@ class DataIntegrationIDE:
             self.monitoring_active = False
             self.update_monitoring_status()
 
-
-    def create_steps(self):
-        """Create notebook tabs for each integration step"""
-        # Create frames for each step
-        self.frames = {}
-        # In create_steps method
-        self.frames["Source Selection"] = self.create_source_selection()
-        self.frames["Target Config"] = self.create_target_config()
-        self.frames["Kafka Config"] = self.create_kafka_config()  # Add this line
-        self.frames["Mapping Rules"] = self.create_mapping_rules()
-        self.frames["Monitoring"] = self.create_monitoring()
-        
-        # Add frames to notebook
-        for step in self.steps:
-            self.notebook.add(self.frames[step], text=step)
-        
-        # Navigation buttons frame
-        nav_frame = ttk.Frame(self.root)
-        nav_frame.pack(pady=5, fill='x')
-        
-        # Previous button
-        self.prev_button = ttk.Button(nav_frame, 
-                                    text="Previous", 
-                                    command=self.previous_step)
-        self.prev_button.pack(side='left', padx=5)
-        
-        # Next button
-        self.next_button = ttk.Button(nav_frame, 
-                                    text="Next", 
-                                    command=self.next_step)
-        self.next_button.pack(side='right', padx=5)
-        
-        # Initially disable previous button
-        self.prev_button.config(state='disabled')
 
     def previous_step(self):
         """Navigate to previous step"""
@@ -2282,6 +2136,59 @@ class DataIntegrationIDE:
         except Exception as e:
             self.logger.error(f"Failed to load mapping rule: {str(e)}")
             messagebox.showerror("Error", "Failed to load mapping rule")
+
+    def create_steps(self):
+        """Create notebook tabs for each integration step"""
+        # Create frames for each step
+        self.frames = {}
+        # In create_steps method
+        self.frames["Source Selection"] = self.create_source_selection()
+        self.frames["Target Config"] = self.create_target_config()
+        self.frames["Kafka Config"] = self.create_kafka_config()
+        self.frames["Mapping Rules"] = self.create_mapping_rules()
+        self.frames["Monitoring"] = self.create_monitoring()
+        
+        # Add frames to notebook
+        for step in self.steps:
+            self.notebook.add(self.frames[step], text=step)
+        
+        # Navigation buttons frame
+        nav_frame = ttk.Frame(self.root)
+        nav_frame.pack(pady=5, fill='x')
+        
+        # Previous button
+        self.prev_button = ttk.Button(nav_frame, 
+                                    text="Previous", 
+                                    command=self.previous_step)
+        self.prev_button.pack(side='left', padx=5)
+        
+        # Next button
+        self.next_button = ttk.Button(nav_frame, 
+                                    text="Next", 
+                                    command=self.next_step)
+        self.next_button.pack(side='right', padx=5)
+        
+        # Initially disable previous button
+        self.prev_button.config(state='disabled')
+        
+        # Add binding for tab changes
+        self.notebook.bind('<<NotebookTabChanged>>', self.on_tab_changed)
+
+    def on_tab_changed(self, event=None):
+        """Handle tab changes"""
+        current_tab = self.notebook.select()
+        tab_index = self.notebook.index(current_tab)
+        
+        # Enable/disable navigation buttons based on current tab
+        if tab_index == 0:  # First tab
+            self.prev_button.config(state='disabled')
+            self.next_button.config(state='normal')
+        elif tab_index == len(self.steps) - 1:  # Last tab (Monitoring)
+            self.prev_button.config(state='normal')
+            self.next_button.config(state='disabled')
+        else:  # Middle tabs
+            self.prev_button.config(state='normal')
+            self.next_button.config(state='normal')
                 
     def on_table_selected(self, event=None):
         """Handle table selection and automatically set Neo4j label if auto-label is enabled"""
@@ -2510,49 +2417,43 @@ class DataIntegrationIDE:
             with open(f'mappings/{current}.json', 'r') as f:
                 mapping = json.load(f)
             
-            # Create topic names with rule name to avoid conflicts
+            # Generate unique rule_id
+            rule_id = str(uuid.uuid4())
+            
+            # Update monitoring database first
+            conn = sqlite3.connect('monitoring.db')
+            c = conn.cursor()
+            
+            # Insert into deployed_rules
+            c.execute('''INSERT OR REPLACE INTO deployed_rules 
+                        (rule_id, rule_name, source_type, source_table, 
+                        target_label, kafka_topic, status, last_updated, 
+                        created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), 
+                        datetime('now'), datetime('now'))''',
+                    (rule_id, current, mapping['source']['type'],
+                    mapping['source']['table'], mapping['target']['label'],
+                    f"{self.kafka_entries['topic_prefix'].get()}_{current}",
+                    'Deployed'))
+            
+            conn.commit()
+            conn.close()
+
+            # Create Kafka topics
             source_topic = f"{self.kafka_entries['topic_prefix'].get()}_{current}_source"
             sink_topic = f"{self.kafka_entries['topic_prefix'].get()}_{current}_sink"
             mapping_topic = f"{self.kafka_entries['topic_prefix'].get()}_mappings"
             
             # Create topics with proper configuration
-            from confluent_kafka.admin import AdminClient, NewTopic
-            admin_client = AdminClient({
-                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get()
-            })
-
-            # Configure topics with retention and cleanup policies
-            topic_configs = {
-                'cleanup.policy': 'compact',
-                'retention.ms': '604800000',  # 7 days
-                'delete.retention.ms': '86400000'  # 1 day
-            }
-
-            topics_to_create = []
-            for topic in [source_topic, sink_topic, mapping_topic]:
-                if topic not in admin_client.list_topics().topics:
-                    topics_to_create.append(NewTopic(
-                        topic,
-                        num_partitions=1,
-                        replication_factor=1,
-                        config=topic_configs
-                    ))
-
-            if topics_to_create:
-                fs = admin_client.create_topics(topics_to_create)
-                for topic, f in fs.items():
-                    try:
-                        f.result(timeout=5)
-                    except Exception as e:
-                        raise Exception(f"Failed to create topic {topic}: {str(e)}")
-
+            self.ensure_topics_exist([source_topic, sink_topic, mapping_topic])
+            
             # Add topic information to mapping
             mapping['kafka'] = {
                 'source_topic': source_topic,
                 'sink_topic': sink_topic,
                 'mapping_topic': mapping_topic
             }
-                
+            
             # Deploy mapping configuration
             producer = Producer({
                 'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
@@ -2566,9 +2467,18 @@ class DataIntegrationIDE:
             )
             producer.flush(timeout=10)
 
-            # Start sync consumer immediately after deployment
-            self.start_sync_consumer(current)
-            
+            # Log the deployment
+            self.log_kafka_action(
+                action_type="DEPLOYMENT_SUCCESS",
+                rule_name=current,
+                topic_name=mapping_topic,
+                status="SUCCESS",
+                details=f"Successfully deployed mapping rule '{current}'"
+            )
+
+            # Refresh monitoring display
+            self.refresh_monitoring()
+
             messagebox.showinfo("Success", 
                 f"Mapping rule '{current}' deployed successfully\n\n"
                 f"Topics created:\n"
