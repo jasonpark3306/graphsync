@@ -29,7 +29,7 @@ except ImportError:
 
 class DataIntegrationIDE:
     def init_monitoring_db(self):
-        """Initialize SQLite database for monitoring"""
+        """Initialize SQLite database for monitoring with enhanced action logging"""
         try:
             # Delete existing database if exists
             if os.path.exists('monitoring.db'):
@@ -38,29 +38,65 @@ class DataIntegrationIDE:
             conn = sqlite3.connect('monitoring.db')
             c = conn.cursor()
             
-            # Create tables with correct schema
+            # Create tables with enhanced schema
+            
+            # Deployed rules table
             c.execute('''CREATE TABLE IF NOT EXISTS deployed_rules
-                        (rule_name TEXT PRIMARY KEY,
+                        (rule_id TEXT PRIMARY KEY,
+                        rule_name TEXT,
                         source_type TEXT,
                         source_table TEXT,
                         target_label TEXT,
                         kafka_topic TEXT,
                         status TEXT,
-                        last_updated TEXT)''')
+                        last_updated TEXT,
+                        created_at TEXT,
+                        updated_at TEXT)''')
             
+            # Integration status table
             c.execute('''CREATE TABLE IF NOT EXISTS integration_status
-                        (timestamp TEXT,
+                        (status_id TEXT PRIMARY KEY,
+                        timestamp TEXT,
                         rule_name TEXT,
                         records_processed INTEGER,
                         success_count INTEGER,
-                        error_count INTEGER)''')
+                        error_count INTEGER,
+                        status TEXT,
+                        details TEXT)''')
             
+            # Topic status table
             c.execute('''CREATE TABLE IF NOT EXISTS topic_status
-                        (topic_name TEXT PRIMARY KEY,
+                        (topic_id TEXT PRIMARY KEY,
+                        topic_name TEXT,
                         message_count INTEGER,
                         last_offset INTEGER,
+                        status TEXT,
                         last_updated TEXT)''')
             
+            # New table for Kafka action logging
+            c.execute('''CREATE TABLE IF NOT EXISTS kafka_actions
+                        (action_id TEXT PRIMARY KEY,
+                        action_type TEXT,
+                        rule_name TEXT,
+                        topic_name TEXT,
+                        status TEXT,
+                        timestamp TEXT,
+                        details TEXT,
+                        error_message TEXT)''')
+            
+            # New table for sync operations
+            c.execute('''CREATE TABLE IF NOT EXISTS sync_operations
+                        (sync_id TEXT PRIMARY KEY,
+                        rule_name TEXT,
+                        start_time TEXT,
+                        end_time TEXT,
+                        status TEXT,
+                        total_records INTEGER,
+                        processed_records INTEGER,
+                        success_count INTEGER,
+                        error_count INTEGER,
+                        details TEXT)''')
+                        
             conn.commit()
             conn.close()
             self.logger.info("Monitoring database initialized successfully")
@@ -69,6 +105,61 @@ class DataIntegrationIDE:
             self.logger.error(f"Failed to initialize monitoring database: {str(e)}")
             messagebox.showerror("Error", "Failed to initialize monitoring database")
 
+    def log_kafka_action(self, action_type, rule_name, topic_name=None, status="SUCCESS", details=None, error_message=None):
+        """Log Kafka-related actions to the database"""
+        try:
+            conn = sqlite3.connect('monitoring.db')
+            c = conn.cursor()
+            
+            action_id = str(uuid.uuid4())
+            timestamp = datetime.now().isoformat()
+            
+            c.execute('''INSERT INTO kafka_actions 
+                        (action_id, action_type, rule_name, topic_name, status, 
+                        timestamp, details, error_message)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (action_id, action_type, rule_name, topic_name, status, 
+                    timestamp, details, error_message))
+            
+            conn.commit()
+            conn.close()
+            
+            self.logger.info(f"Logged Kafka action: {action_type} for rule {rule_name}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to log Kafka action: {str(e)}")
+                    
+    def track_sync_operation(self, rule_name, status="STARTED", details=None):
+        """Track synchronization operations in the database"""
+        try:
+            conn = sqlite3.connect('monitoring.db')
+            c = conn.cursor()
+            
+            if status == "STARTED":
+                sync_id = str(uuid.uuid4())
+                c.execute('''INSERT INTO sync_operations 
+                            (sync_id, rule_name, start_time, status, 
+                            total_records, processed_records, success_count, 
+                            error_count, details)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                        (sync_id, rule_name, datetime.now().isoformat(), 
+                        status, 0, 0, 0, 0, details))
+                        
+            else:  # Update existing sync operation
+                c.execute('''UPDATE sync_operations 
+                            SET status = ?,
+                            end_time = ?,
+                            details = ?
+                            WHERE rule_name = ? 
+                            AND end_time IS NULL''',
+                        (status, datetime.now().isoformat(), details, rule_name))
+            
+            conn.commit()
+            conn.close()
+            
+        except Exception as e:
+            self.logger.error(f"Failed to track sync operation: {str(e)}")
+            
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Data Integration IDE")
@@ -490,6 +581,14 @@ class DataIntegrationIDE:
         """Deploy mapping rules to Kafka"""
         producer = None
         try:
+
+            # Log deployment start
+            self.log_kafka_action(
+                action_type="DEPLOYMENT_START",
+                rule_name=self.mapping_rule_var.get(),
+                details="Starting deployment of mapping rules"
+            )
+
             # First, do a comprehensive Kafka check
             if not self.test_kafka_connection_silent():
                 raise Exception("Kafka connection failed")
@@ -539,8 +638,23 @@ class DataIntegrationIDE:
                         f"Target: {mappings['target']['label']}")
                 else:
                     raise Exception("Failed to verify mapping deployment")
+                
+                self.log_kafka_action(
+                    action_type="DEPLOYMENT_SUCCESS",
+                    rule_name=self.mapping_rule_var.get(),
+                    topic_name=topic,
+                    details=f"Successfully deployed mapping rules to topic {topic}"
+                )
 
             except Exception as e:
+                # Log deployment failure
+                self.log_kafka_action(
+                    action_type="DEPLOYMENT_FAILURE",
+                    rule_name=self.mapping_rule_var.get(),
+                    status="ERROR",
+                    error_message=str(e),
+                    details="Failed to deploy mapping rules"
+                )
                 raise Exception(f"Failed to send mapping rules: {str(e)}")
 
         except Exception as e:
@@ -782,44 +896,11 @@ class DataIntegrationIDE:
             
         except Exception as e:
             messagebox.showerror("Error", f"Failed to read topic messages: {str(e)}")
-
-    def test_complete_workflow(self):
-        """Test complete workflow from mapping to monitoring"""
-        try:
-            # 1. Verify source connection
-            if not self.check_source_connection():
-                return "Source database not connected"
-                
-            # 2. Verify Kafka connection
-            if not self.test_kafka_connection_silent():
-                return "Kafka not connected"
-                
-            # 3. Verify Neo4j connection
-            try:
-                self.test_neo4j_connection()
-            except:
-                return "Neo4j not connected"
-                
-            # 4. Check mapping deployment
-            topic = f"{self.kafka_entries['topic_prefix'].get()}_mappings"
-            producer = Producer({
-                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get()
-            })
-            producer.flush()
-            
-            # 5. Verify monitoring setup
-            if not self.check_database_status():
-                return "Monitoring database not initialized"
-                
-            return "All systems verified and working"
-            
-        except Exception as e:
-            return f"Workflow test failed: {str(e)}"
-                
+      
     def create_monitoring(self):
         frame = ttk.Frame(self.notebook)
         
-        # Create main layout with three panes instead of two
+        # Create main layout with three panes
         paned = ttk.PanedWindow(frame, orient='vertical')
         paned.pack(fill='both', expand=True, padx=10, pady=10)
         
@@ -883,6 +964,40 @@ class DataIntegrationIDE:
         control_frame = ttk.Frame(frame)
         control_frame.pack(fill='x', padx=10, pady=5)
 
+        # Left side buttons
+        left_buttons_frame = ttk.Frame(control_frame)
+        left_buttons_frame.pack(side='left')
+
+        # Left side buttons
+        ttk.Button(left_buttons_frame, text="Refresh Status", 
+                command=self.refresh_monitoring).pack(side='left', padx=5)
+        ttk.Button(left_buttons_frame, text="View Details", 
+                command=self.show_sync_details).pack(side='left', padx=5)
+        ttk.Button(left_buttons_frame, text="View Action History", 
+                command=self.show_action_history).pack(side='left', padx=5)
+        ttk.Button(left_buttons_frame, text="Diagnostic Check", 
+                command=lambda: messagebox.showinfo(
+                    "System Check", 
+                    self.test_complete_workflow()
+                )).pack(side='left', padx=5)
+        
+
+        # Right side buttons
+        right_buttons_frame = ttk.Frame(control_frame)
+        right_buttons_frame.pack(side='right')
+        
+        ttk.Button(right_buttons_frame, text="Verify Sync", 
+                command=self.verify_data_sync).pack(side='left', padx=5)
+        ttk.Button(right_buttons_frame, text="Start Monitoring", 
+                command=self.start_monitoring).pack(side='left', padx=5)
+        ttk.Button(right_buttons_frame, text="Stop Monitoring", 
+                command=self.stop_monitoring).pack(side='left', padx=5)
+
+        # Status bar and remaining setup
+        status_bar = ttk.Frame(frame)
+        status_bar.pack(fill='x', padx=10, pady=5)
+        
+    
         # Add to control_frame in create_monitoring
         ttk.Button(control_frame, text="Diagnostic Check", 
                 command=lambda: messagebox.showinfo(
@@ -898,6 +1013,9 @@ class DataIntegrationIDE:
                 command=self.refresh_monitoring).pack(side='left', padx=5)
         ttk.Button(left_buttons_frame, text="View Details", 
                 command=self.show_sync_details).pack(side='left', padx=5)
+        # Add Action History button here
+        ttk.Button(left_buttons_frame, text="View Action History", 
+                command=self.show_action_history).pack(side='left', padx=5)
         
         # Right side buttons
         right_buttons_frame = ttk.Frame(control_frame)
@@ -950,28 +1068,6 @@ class DataIntegrationIDE:
         self.update_connection_indicators()
         
         return frame
-
-    def update_connection_indicators(self):
-        """Update the connection status indicators"""
-        def draw_indicator(canvas, connected):
-            canvas.delete("all")
-            color = "#2ECC71" if connected else "#E74C3C"  # Green if connected, red if not
-            canvas.create_oval(2, 2, 10, 10, fill=color, outline=color)
-        
-        # Update source indicator
-        draw_indicator(self.source_indicator, self.monitoring_active)
-        self.source_status.config(
-            text="Source: Connected" if self.monitoring_active else "Source: Not Connected",
-            foreground="#2ECC71" if self.monitoring_active else "#E74C3C"
-        )
-        
-        # Update sink indicator
-        draw_indicator(self.sink_indicator, self.monitoring_active)
-        self.sink_status.config(
-            text="Sink: Connected" if self.monitoring_active else "Sink: Not Connected",
-            foreground="#2ECC71" if self.monitoring_active else "#E74C3C"
-        )
-
 
     def start_auto_refresh(self):
         """Start auto-refresh for monitoring"""
@@ -1063,12 +1159,6 @@ class DataIntegrationIDE:
         self.rules_tree.heading("topic", text="Kafka Topic")
         self.rules_tree.heading("status", text="Status")
         
-        self.rules_tree.column("rule", width=150)
-        self.rules_tree.column("source", width=150)
-        self.rules_tree.column("target", width=150)
-        self.rules_tree.column("topic", width=150)
-        self.rules_tree.column("status", width=100)
-        
         # Add scrollbar to rules tree
         rules_scroll = ttk.Scrollbar(rules_frame, orient="vertical", command=self.rules_tree.yview)
         self.rules_tree.configure(yscrollcommand=rules_scroll.set)
@@ -1076,22 +1166,6 @@ class DataIntegrationIDE:
         # Pack rules tree and scrollbar
         self.rules_tree.pack(side='left', fill='both', expand=True)
         rules_scroll.pack(side='right', fill='y')
-        
-        # Bind double-click event
-        self.rules_tree.bind('<Double-1>', self.on_rule_selected)
-        
-        # Rules actions frame
-        rules_actions = ttk.Frame(rules_frame)
-        rules_actions.pack(fill='x', padx=5, pady=5)
-        
-        ttk.Button(rules_actions, text="Show Topics",
-                command=lambda: self.show_rule_topics(
-                    self.rules_tree.item(self.rules_tree.selection()[0])['values'][0]
-                    if self.rules_tree.selection() else None
-                )).pack(side='left', padx=5)
-        
-        ttk.Button(rules_actions, text="Verify Sync",
-                command=self.verify_data_sync).pack(side='left', padx=5)
         
         # Bottom frame for sync status
         status_frame = ttk.LabelFrame(paned, text="Synchronization Status")
@@ -1108,81 +1182,32 @@ class DataIntegrationIDE:
         self.status_tree.heading("success", text="Success Count")
         self.status_tree.heading("errors", text="Error Count")
         
-        self.status_tree.column("timestamp", width=150)
-        self.status_tree.column("rule", width=150)
-        self.status_tree.column("records", width=100)
-        self.status_tree.column("success", width=100)
-        self.status_tree.column("errors", width=100)
-        
         # Add scrollbar to status tree
         status_scroll = ttk.Scrollbar(status_frame, orient="vertical", command=self.status_tree.yview)
         self.status_tree.configure(yscrollcommand=status_scroll.set)
         
+        # Pack status tree and scrollbar  
         self.status_tree.pack(side='left', fill='both', expand=True)
         status_scroll.pack(side='right', fill='y')
 
-        # Control frame
+        # Control buttons frame
         control_frame = ttk.Frame(frame)
         control_frame.pack(fill='x', padx=10, pady=5)
-        
-        # Add diagnostic check button
-        ttk.Button(control_frame, text="Diagnostic Check", 
-                command=lambda: messagebox.showinfo(
-                    "System Check", 
-                    self.test_complete_workflow()
-                )).pack(side='left', padx=5)
-        
+
         # Left side buttons
         left_buttons_frame = ttk.Frame(control_frame)
         left_buttons_frame.pack(side='left')
         
         ttk.Button(left_buttons_frame, text="Refresh Status", 
                 command=self.refresh_monitoring).pack(side='left', padx=5)
-        ttk.Button(left_buttons_frame, text="View Details", 
-                command=self.show_sync_details).pack(side='left', padx=5)
-        
-        # Right side buttons
-        right_buttons_frame = ttk.Frame(control_frame)
-        right_buttons_frame.pack(side='right')
-        
-        ttk.Button(right_buttons_frame, text="Verify Sync", 
-                command=self.verify_data_sync).pack(side='left', padx=5)
-        ttk.Button(right_buttons_frame, text="Start Monitoring", 
-                command=self.start_monitoring).pack(side='left', padx=5)
-        ttk.Button(right_buttons_frame, text="Stop Monitoring", 
-                command=self.stop_monitoring).pack(side='left', padx=5)
-        
-        # Status bar
-        status_bar = ttk.Frame(frame)
-        status_bar.pack(fill='x', padx=10, pady=5)
-        
-        # Connection status indicators frame
-        conn_status_frame = ttk.Frame(status_bar)
-        conn_status_frame.pack(side='left')
-        
-        # Source status with icon
-        source_frame = ttk.Frame(conn_status_frame)
-        source_frame.pack(side='left', padx=10)
-        self.source_status = ttk.Label(source_frame, text="Source: Not Connected")
-        self.source_status.pack(side='left')
-        self.source_indicator = tk.Canvas(source_frame, width=12, height=12)
-        self.source_indicator.pack(side='left', padx=5)
-        
-        # Sink status with icon
-        sink_frame = ttk.Frame(conn_status_frame)
-        sink_frame.pack(side='left', padx=10)
-        self.sink_status = ttk.Label(sink_frame, text="Sink: Not Connected")
-        self.sink_status.pack(side='left')
-        self.sink_indicator = tk.Canvas(sink_frame, width=12, height=12)
-        self.sink_indicator.pack(side='left', padx=5)
-        
-        # Initialize monitoring state
-        self.monitoring_active = False
-        self.update_monitoring_status()
-        
-        # Update initial status indicators
-        self.update_connection_indicators()
-        
+        ttk.Button(left_buttons_frame, text="Show Topics",
+                command=lambda: self.show_rule_topics(
+                    self.rules_tree.item(self.rules_tree.selection()[0])['values'][0]
+                    if self.rules_tree.selection() else None
+                )).pack(side='left', padx=5)
+        ttk.Button(left_buttons_frame, text="View Action History", 
+                command=self.show_action_history).pack(side='left', padx=5)
+
         return frame
 
     def get_rule_topics(self, rule_name):
@@ -1339,53 +1364,7 @@ class DataIntegrationIDE:
         except Exception as e:
             self.logger.error(f"Failed to check rule deployment: {str(e)}")
             return False
-        
-    def verify_data_sync(self):
-        """Verify data synchronization between source and Neo4j"""
-        try:
-            # Get current mapping rule
-            selected = self.rules_tree.selection()
-            if not selected:
-                messagebox.showwarning("Warning", "Please select a mapping rule to verify")
-                return
-                
-            rule_name = self.rules_tree.item(selected[0])['values'][0]
-            
-            # Load mapping configuration
-            with open(f'mappings/{rule_name}.json', 'r') as f:
-                mapping = json.load(f)
-                
-            # Check source data
-            source_count = self.get_source_count(mapping)
-            
-            # Check Neo4j data
-            target_count = self.get_neo4j_count(mapping)
-            
-            # Create verification window
-            verify_window = tk.Toplevel(self.root)
-            verify_window.title("Data Sync Verification")
-            verify_window.geometry("400x300")
-            
-            # Add verification details
-            text = tk.Text(verify_window, wrap=tk.WORD, padx=10, pady=10)
-            text.pack(fill='both', expand=True)
-            
-            text.insert('end', f"Rule: {rule_name}\n\n")
-            text.insert('end', f"Source Records: {source_count}\n")
-            text.insert('end', f"Neo4j Nodes: {target_count}\n")
-            text.insert('end', f"\nSync Status: ")
-            
-            if source_count == target_count:
-                text.insert('end', "✓ Fully Synced\n")
-            else:
-                text.insert('end', f"⚠ Pending Sync\n")
-                text.insert('end', f"Records remaining: {source_count - target_count}\n")
-            
-            text.configure(state='disabled')
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to verify data sync: {str(e)}")
-
+       
     def get_source_count(self, mapping):
         """Get record count from source database"""
         try:
@@ -1506,38 +1485,6 @@ class DataIntegrationIDE:
         except Exception as e:
             self.logger.error(f"Failed to update status tree: {str(e)}")
 
-    def start_monitoring(self):
-        """Start monitoring Kafka topics"""
-        try:
-            # Validate Kafka configuration first
-            is_valid, message = self.validate_kafka_config()
-            if not is_valid:
-                messagebox.showerror("Configuration Error", message)
-                return False
-
-            if not self.monitoring_active:
-                # Check database status before starting
-                if not self.check_database_status():
-                    messagebox.showerror("Error", "Failed to initialize monitoring database")
-                    return False
-                    
-                self.monitoring_active = True
-                self.monitor_thread = threading.Thread(target=self.monitor_kafka_topics, daemon=True)
-                self.monitor_thread.start()
-                self.update_monitoring_status()
-                return True
-
-        except Exception as e:
-            self.logger.error(f"Failed to start monitoring: {str(e)}")
-            messagebox.showerror("Error", f"Failed to start monitoring: {str(e)}")
-            return False
-
-    def stop_monitoring(self):
-        """Stop monitoring Kafka topics"""
-        self.monitoring_active = False
-        self.update_monitoring_status()
-
-
     def validate_kafka_setup(self):
         """Validate entire Kafka setup including configuration and connectivity"""
         try:
@@ -1567,16 +1514,6 @@ class DataIntegrationIDE:
 
         except Exception as e:
             return False, f"Validation failed: {str(e)}"
-
-
-    def update_monitoring_status(self):
-        """Update monitoring status indicators"""
-        if self.monitoring_active:
-            self.source_status.config(text="Source: Connected", foreground='green')
-            self.sink_status.config(text="Sink: Connected", foreground='green')
-        else:
-            self.source_status.config(text="Source: Not Connected", foreground='red')
-            self.sink_status.config(text="Sink: Not Connected", foreground='red')
 
     def monitor_kafka_topics(self):
         """Background thread to monitor Kafka topics"""
@@ -1613,34 +1550,6 @@ class DataIntegrationIDE:
             self.logger.error(f"Monitoring error: {str(e)}")
             self.monitoring_active = False
             self.update_monitoring_status()
-
-    def show_sync_details(self):
-        """Show detailed sync information"""
-        selected = self.status_tree.selection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please select a status entry to view details")
-            return
-            
-        # Get selected status
-        values = self.status_tree.item(selected[0])['values']
-        
-        # Create details window
-        details = tk.Toplevel(self.root)
-        details.title("Sync Details")
-        details.geometry("500x400")
-        
-        # Add details
-        text = tk.Text(details, wrap=tk.WORD, padx=10, pady=10)
-        text.pack(fill='both', expand=True)
-        
-        text.insert('end', f"Timestamp: {values[0]}\n")
-        text.insert('end', f"Rule Name: {values[1]}\n")
-        text.insert('end', f"Records Processed: {values[2]}\n")
-        text.insert('end', f"Success Count: {values[3]}\n")
-        text.insert('end', f"Error Count: {values[4]}\n")
-        
-        text.configure(state='disabled')
-        
 
 
     def create_steps(self):
@@ -3517,6 +3426,19 @@ class DataIntegrationIDE:
     def start_sync_for_rule(self, rule_name):
         """Start synchronization for a specific rule"""
         try:
+            # Log sync start
+            self.log_kafka_action(
+                action_type="SYNC_START",
+                rule_name=rule_name,
+                details="Starting data synchronization"
+            )
+            
+            self.track_sync_operation(
+                rule_name=rule_name,
+                status="STARTED",
+                details="Initializing synchronization"
+            )
+
             # Load mapping configuration
             with open(f'mappings/{rule_name}.json', 'r') as f:
                 mapping = json.load(f)
@@ -3620,17 +3542,84 @@ class DataIntegrationIDE:
                 conn.close()
                 producer.flush()  # Final flush
 
+                # Log successful sync start
+                self.log_kafka_action(
+                    action_type="SYNC_RUNNING",
+                    rule_name=rule_name,
+                    details=f"Sync process started successfully"
+                )
+
                 messagebox.showinfo("Success", 
                     f"Started sync for rule '{rule_name}'\n"
                     f"Produced {total_count} messages to topic {source_topic}")
                 return True
-                
+            
         except Exception as e:
+            # Log sync failure
+            self.log_kafka_action(
+                action_type="SYNC_FAILURE",
+                rule_name=rule_name,
+                status="ERROR",
+                error_message=str(e),
+                details="Failed to start synchronization"
+            )
+            
+            self.track_sync_operation(
+                rule_name=rule_name,
+                status="FAILED",
+                details=f"Sync failed: {str(e)}"
+            )
+
             self.logger.error(f"Failed to start sync: {str(e)}")
             messagebox.showerror("Error", f"Failed to start sync: {str(e)}")
             return False
         
-
+    def show_action_history(self):
+        """Display Kafka action history"""
+        try:
+            conn = sqlite3.connect('monitoring.db')
+            c = conn.cursor()
+            
+            # Get recent actions
+            c.execute('''SELECT action_type, rule_name, topic_name, status, 
+                        timestamp, details, error_message 
+                        FROM kafka_actions 
+                        ORDER BY timestamp DESC LIMIT 100''')
+            
+            actions = c.fetchall()
+            conn.close()
+            
+            # Create history window
+            history_window = tk.Toplevel(self.root)
+            history_window.title("Kafka Action History")
+            history_window.geometry("800x600")
+            
+            # Create Treeview
+            tree = ttk.Treeview(history_window, 
+                            columns=("timestamp", "action", "rule", "status", "details"),
+                            show='headings')
+            
+            tree.heading("timestamp", text="Timestamp")
+            tree.heading("action", text="Action")
+            tree.heading("rule", text="Rule Name")
+            tree.heading("status", text="Status")
+            tree.heading("details", text="Details")
+            
+            # Add actions to tree
+            for action in actions:
+                tree.insert('', 'end', values=(
+                    action[4],  # timestamp
+                    action[0],  # action_type
+                    action[1],  # rule_name
+                    action[3],  # status
+                    action[5]   # details
+                ))
+            
+            tree.pack(fill='both', expand=True)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to show action history: {str(e)}")
+            
     def ensure_topics_exist(self, topic_list):
         """Ensure all required topics exist"""
         try:
