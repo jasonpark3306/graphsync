@@ -13,10 +13,15 @@ from datetime import datetime
 import threading
 from datetime import datetime
 import time
+from datetime import datetime, date  # Add date here
+from decimal import Decimal
+from uuid import UUID
+import uuid
 
 # Kafka imports
 try:
     from confluent_kafka import Producer, Consumer, KafkaException, TopicPartition
+    from confluent_kafka.admin import AdminClient, NewTopic  # Add this line
 except ImportError:
     messagebox.showerror("Import Error", 
         "confluent-kafka is not installed.\n"
@@ -2587,56 +2592,48 @@ class DataIntegrationIDE:
     def deploy_selected_mapping(self):
         """Deploy currently selected mapping rule to Kafka"""
         try:
-            # Validate Kafka configuration first
-            is_valid, message = self.validate_kafka_config()
-            if not is_valid:
-                messagebox.showerror("Configuration Error", message)
-                return False
-
             current = self.mapping_rule_var.get()
             if not current:
                 messagebox.showwarning("Warning", "Please select a mapping rule to deploy")
                 return False
                 
             # Load mapping rule
-            mapping_file = f"mappings/{current}.json"
-            if not os.path.exists(mapping_file):
-                raise Exception("Mapping file not found")
-                
-            with open(mapping_file, 'r') as f:
+            with open(f'mappings/{current}.json', 'r') as f:
                 mapping = json.load(f)
             
-            # Create topic names        
-            source_topic = f"{self.kafka_entries['topic_prefix'].get()}_{mapping['source']['table']}_source"
-            sink_topic = f"{self.kafka_entries['topic_prefix'].get()}_{mapping['source']['table']}_sink"
+            # Create topic names with rule name to avoid conflicts
+            source_topic = f"{self.kafka_entries['topic_prefix'].get()}_{current}_source"
+            sink_topic = f"{self.kafka_entries['topic_prefix'].get()}_{current}_sink"
             mapping_topic = f"{self.kafka_entries['topic_prefix'].get()}_mappings"
             
-            # Test Kafka connection first
-            if not self.test_kafka_connection_silent():
-                raise Exception("Kafka is not connected. Please check your Kafka configuration.")
-
-            # Create topics if they don't exist
+            # Create topics with proper configuration
             from confluent_kafka.admin import AdminClient, NewTopic
             admin_client = AdminClient({
                 'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get()
             })
 
-            existing_topics = admin_client.list_topics().topics
-            topics_to_create = []
+            # Configure topics with retention and cleanup policies
+            topic_configs = {
+                'cleanup.policy': 'compact',
+                'retention.ms': '604800000',  # 7 days
+                'delete.retention.ms': '86400000'  # 1 day
+            }
 
+            topics_to_create = []
             for topic in [source_topic, sink_topic, mapping_topic]:
-                if topic not in existing_topics:
+                if topic not in admin_client.list_topics().topics:
                     topics_to_create.append(NewTopic(
                         topic,
                         num_partitions=1,
-                        replication_factor=1
+                        replication_factor=1,
+                        config=topic_configs
                     ))
 
             if topics_to_create:
                 fs = admin_client.create_topics(topics_to_create)
                 for topic, f in fs.items():
                     try:
-                        f.result(timeout=5)  # Wait for topic creation
+                        f.result(timeout=5)
                     except Exception as e:
                         raise Exception(f"Failed to create topic {topic}: {str(e)}")
 
@@ -2647,76 +2644,36 @@ class DataIntegrationIDE:
                 'mapping_topic': mapping_topic
             }
                 
-            # Deploy to Kafka
+            # Deploy mapping configuration
             producer = Producer({
                 'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
-                'client.id': 'data_integration_deploy',
-                'acks': 'all',
-                'retries': 3,
-                'retry.backoff.ms': 1000,
-                'delivery.timeout.ms': 10000,
-                'request.timeout.ms': 5000
+                'acks': 'all'
             })
             
-            # Send mapping configuration
             producer.produce(
                 mapping_topic,
                 key=current.encode('utf-8'),
                 value=json.dumps(mapping).encode('utf-8')
             )
             producer.flush(timeout=10)
-                
-            # Update monitoring database
-            conn = sqlite3.connect('monitoring.db')
-            c = conn.cursor()
-            
-            # Store deployment information
-            c.execute('''INSERT OR REPLACE INTO deployed_rules 
-                        (rule_name, source_type, source_table, target_label, kafka_topic, status, last_updated)
-                        VALUES (?, ?, ?, ?, ?, ?, datetime('now'))''',
-                    (current, 
-                    mapping['source']['type'],
-                    mapping['source']['table'],
-                    mapping['target']['label'],
-                    json.dumps({
-                        'source': source_topic,
-                        'sink': sink_topic,
-                        'mapping': mapping_topic
-                    }),
-                    'Deployed'))
 
-            # Add initial monitoring entry
-            c.execute('''INSERT INTO integration_status 
-                        (timestamp, rule_name, records_processed, success_count, error_count)
-                        VALUES (datetime('now'), ?, 0, 0, 0)''',
-                    (current,))
+            # Start sync consumer immediately after deployment
+            self.start_sync_consumer(current)
             
-            conn.commit()
-            conn.close()
-            
-            # Refresh monitoring display
-            self.refresh_monitoring()
-                
-            # Show success message with topics
             messagebox.showinfo("Success", 
                 f"Mapping rule '{current}' deployed successfully\n\n"
-                f"Created Topics:\n"
+                f"Topics created:\n"
                 f"Source: {source_topic}\n"
                 f"Sink: {sink_topic}\n"
                 f"Mapping: {mapping_topic}")
 
-            # Verify deployment
-            self.verify_deployment(current, {
-                'source_topic': source_topic,
-                'sink_topic': sink_topic,
-                'mapping_topic': mapping_topic
-            })
-                
+            return True
+
         except Exception as e:
-            self.logger.error(f"Failed to deploy mapping rule: {str(e)}")
+            self.logger.error(f"Deployment failed: {str(e)}")
             messagebox.showerror("Error", f"Failed to deploy mapping rule: {str(e)}")
             return False
-
+        
     def verify_deployment(self, rule_name, topics):
         """Verify deployment by checking topics and configurations"""
         try:
@@ -3253,128 +3210,6 @@ class DataIntegrationIDE:
             self.logger.error(f"Failed to load source tables: {str(e)}")
             return []
 
-
-    def show_rule_topics(self, rule_name):
-        """Show topics for a specific rule"""
-        try:
-            # Validate Kafka configuration first
-            is_valid, message = self.validate_kafka_config()
-            if not is_valid:
-                messagebox.showerror("Configuration Error", message)
-                return
-
-            if not rule_name:
-                messagebox.showwarning("Warning", "Please select a mapping rule")
-                return
-            
-            # Create topics window
-            topics_window = tk.Toplevel(self.root)
-            topics_window.title(f"Kafka Topics for {rule_name}")
-            topics_window.geometry("800x500")
-            
-            # Create Treeview for topics
-            topics_tree = ttk.Treeview(topics_window, 
-                columns=("type", "name", "partitions", "messages", "status"),
-                show='headings',
-                height=10)
-                
-            # Configure columns
-            topics_tree.heading("type", text="Topic Type")
-            topics_tree.heading("name", text="Topic Name")
-            topics_tree.heading("partitions", text="Partitions")
-            topics_tree.heading("messages", text="Message Count")
-            topics_tree.heading("status", text="Status")
-            
-            topics_tree.column("type", width=100)
-            topics_tree.column("name", width=300)
-            topics_tree.column("partitions", width=100)
-            topics_tree.column("messages", width=120)
-            topics_tree.column("status", width=100)
-            
-            # Add scrollbar
-            scrollbar = ttk.Scrollbar(topics_window, orient="vertical", command=topics_tree.yview)
-            topics_tree.configure(yscrollcommand=scrollbar.set)
-            
-            topics_tree.pack(side='left', fill='both', expand=True)
-            scrollbar.pack(side='right', fill='y')
-
-            # Get topic information
-            prefix = self.kafka_entries['topic_prefix'].get()
-            topics = {
-                'Source': f"{prefix}_{rule_name}_source",
-                'Sink': f"{prefix}_{rule_name}_sink",
-                'Mapping': f"{prefix}_mappings"
-            }
-
-
-            admin_client = AdminClient({
-                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get()
-            })
-            
-            topic_metadata = admin_client.list_topics().topics
-            
-            # Create consumer to get offsets
-            consumer = Consumer({
-                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
-                'group.id': f"{self.kafka_entries['group_id'].get()}_monitor"
-            })
-            
-            for topic_type, topic_name in topics.items():
-                if topic_name in topic_metadata:
-                    metadata = topic_metadata[topic_name]
-                    
-                    # Calculate message count using watermarks
-                    message_count = 0
-                    try:
-                        for partition_id in metadata.partitions:
-                            low_offset, high_offset = consumer.get_watermark_offsets(
-                                TopicPartition(topic_name, partition_id),
-                                timeout=5.0
-                            )
-                            message_count += high_offset - low_offset
-                    except Exception as e:
-                        self.logger.error(f"Failed to get message count: {str(e)}")
-                        message_count = "Error"
-                    
-                    topics_tree.insert('', 'end', values=(
-                        topic_type,
-                        topic_name,
-                        len(metadata.partitions),
-                        message_count,
-                        "Active" if not metadata.error else "Error"
-                    ))
-                else:
-                    topics_tree.insert('', 'end', values=(
-                        topic_type,
-                        topic_name,
-                        "N/A",
-                        "N/A",
-                        "Not Found"
-                    ))
-                    
-            consumer.close()
-            admin_client.close()
-
-            
-            # Add buttons frame
-            button_frame = ttk.Frame(topics_window)
-            button_frame.pack(fill='x', padx=10, pady=5)
-            
-            # Refresh button
-            ttk.Button(button_frame, text="Refresh", 
-                command=lambda: self.refresh_topic_view(topics_tree, rule_name)).pack(side='left', padx=5)
-                
-            # View Messages button
-            ttk.Button(button_frame, text="View Messages", 
-                command=lambda: self.show_topic_messages(
-                    topics_tree.item(topics_tree.selection()[0])['values'][1] 
-                    if topics_tree.selection() else None
-                )).pack(side='left', padx=5)
-                
-        except Exception as e:
-            self.logger.error(f"Failed to show topics: {str(e)}")
-            messagebox.showerror("Error", f"Failed to show topic details: {str(e)}")
-
     def on_rule_selected(self, event=None):
         """Handle rule selection in the main view"""
         selected = self.rules_tree.selection()
@@ -3392,117 +3227,138 @@ class DataIntegrationIDE:
             # Create topics window
             topics_window = tk.Toplevel(self.root)
             topics_window.title(f"Kafka Topics for {rule_name}")
-            topics_window.geometry("800x400")
+            topics_window.geometry("800x500")
             
-            # Create Treeview for topics
-            topics_tree = ttk.Treeview(topics_window, 
+            # Create main frame to hold everything
+            main_frame = ttk.Frame(topics_window)
+            main_frame.pack(fill='both', expand=True, padx=10, pady=10)
+            
+            # Create Treeview frame at the top
+            tree_frame = ttk.Frame(main_frame)
+            tree_frame.pack(fill='both', expand=True)
+            
+            # Create Treeview
+            topics_tree = ttk.Treeview(tree_frame, 
                 columns=("type", "name", "partitions", "messages", "status"),
-                show='headings',
-                height=10)
+                show='headings')
                 
-            # Configure columns
+            # Configure columns    
             topics_tree.heading("type", text="Topic Type")
             topics_tree.heading("name", text="Topic Name")
             topics_tree.heading("partitions", text="Partitions")
             topics_tree.heading("messages", text="Message Count")
             topics_tree.heading("status", text="Status")
             
-            topics_tree.column("type", width=100)
-            topics_tree.column("name", width=300)
-            topics_tree.column("partitions", width=100)
-            topics_tree.column("messages", width=120)
-            topics_tree.column("status", width=100)
-            
             # Add scrollbar
-            scrollbar = ttk.Scrollbar(topics_window, orient="vertical", command=topics_tree.yview)
+            scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=topics_tree.yview)
             topics_tree.configure(yscrollcommand=scrollbar.set)
             
+            # Pack tree and scrollbar
             topics_tree.pack(side='left', fill='both', expand=True)
             scrollbar.pack(side='right', fill='y')
 
-            # Get topic information
-            prefix = self.kafka_entries['topic_prefix'].get()
-            topics = {
-                'Source': f"{prefix}_{rule_name}_source",
-                'Sink': f"{prefix}_{rule_name}_sink",
-                'Mapping': f"{prefix}_mappings"
-            }
-            
-            try:
-                # Create consumer to get message counts
-                consumer = Consumer({
-                    'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
-                    'group.id': f"{self.kafka_entries['group_id'].get()}_monitor"
-                })
-                
-                # Get topic metadata
-                from confluent_kafka.admin import AdminClient
-                admin_client = AdminClient({
-                    'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get()
-                })
-                
-                topic_metadata = admin_client.list_topics().topics
-                
-                for topic_type, topic_name in topics.items():
-                    if topic_name in topic_metadata:
-                        metadata = topic_metadata[topic_name]
-                        
-                        # Calculate message count using consumer watermarks
-                        message_count = 0
-                        for partition_id in metadata.partitions:
-                            low_offset, high_offset = consumer.get_watermark_offsets(
-                                TopicPartition(topic_name, partition_id),
-                                timeout=5.0
-                            )
-                            message_count += high_offset - low_offset
-                        
-                        status = "Active" if not metadata.error else "Error"
-                        
-                        topics_tree.insert('', 'end', values=(
-                            topic_type,
-                            topic_name,
-                            len(metadata.partitions),
-                            message_count,
-                            status
-                        ))
-                    else:
-                        topics_tree.insert('', 'end', values=(
-                            topic_type,
-                            topic_name,
-                            "N/A",
-                            "N/A",
-                            "Not Found"
-                        ))
-                        
-                consumer.close()
-                
-            except Exception as e:
-                self.logger.error(f"Failed to get Kafka metadata: {str(e)}")
-                for topic_type, topic_name in topics.items():
-                    topics_tree.insert('', 'end', values=(
-                        topic_type,
-                        topic_name,
-                        "Error",
-                        "Error",
-                        "Error"
-                    ))
+            # Create buttons frame at the bottom
+            button_frame = ttk.Frame(main_frame)
+            button_frame.pack(fill='x', pady=(10, 0))
 
-            # Add buttons frame
-            button_frame = ttk.Frame(topics_window)
-            button_frame.pack(fill='x', padx=10, pady=5)
-            
-            ttk.Button(button_frame, text="Refresh",
-                    command=lambda: self.refresh_topic_view(topics_window, topics_tree, rule_name)).pack(side='left', padx=5)
-            
+            def refresh_data():
+                """Refresh the topic data"""
+                # Clear existing items
+                for item in topics_tree.get_children():
+                    topics_tree.delete(item)
+                    
+                prefix = self.kafka_entries['topic_prefix'].get()
+                topics = {
+                    'Source': f"{prefix}_{rule_name}_source",
+                    'Sink': f"{prefix}_{rule_name}_sink",
+                    'Mapping': f"{prefix}_mappings"
+                }
+                
+                try:
+                    admin_client = AdminClient({
+                        'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get()
+                    })
+                    
+                    topic_metadata = admin_client.list_topics().topics
+                    
+                    for topic_type, topic_name in topics.items():
+                        if topic_name in topic_metadata:
+                            metadata = topic_metadata[topic_name]
+                            
+                            # Get message count
+                            message_count = 0
+                            for partition in metadata.partitions.values():
+                                try:
+                                    low, high = self.get_topic_offsets(topic_name, partition.id)
+                                    message_count += high - low
+                                except:
+                                    message_count = "Error"
+                            
+                            topics_tree.insert('', 'end', values=(
+                                topic_type,
+                                topic_name,
+                                len(metadata.partitions),
+                                message_count,
+                                "Active" if not metadata.error else "Error"
+                            ))
+                        else:
+                            topics_tree.insert('', 'end', values=(
+                                topic_type,
+                                topic_name,
+                                "N/A",
+                                "N/A",
+                                "Not Found"
+                            ))
+                except Exception as e:
+                    self.logger.error(f"Failed to get Kafka metadata: {str(e)}")
+                    for topic_type, topic_name in topics.items():
+                        topics_tree.insert('', 'end', values=(
+                            topic_type,
+                            topic_name,
+                            "Error",
+                            "Error",
+                            "Error"
+                        ))
+
+            # Add buttons at the bottom
+            ttk.Button(button_frame, text="Refresh", 
+                    command=refresh_data).pack(side='left', padx=5)
             ttk.Button(button_frame, text="View Messages",
-                    command=lambda: self.view_topic_messages(topics_tree)).pack(side='left', padx=5)
-            
+                    command=lambda: self.show_topic_messages(
+                        topics_tree.item(topics_tree.selection()[0])['values'][1]
+                        if topics_tree.selection() else None
+                    )).pack(side='left', padx=5)
             ttk.Button(button_frame, text="Start Sync",
                     command=lambda: self.start_sync_for_rule(rule_name)).pack(side='left', padx=5)
+
+            # Initial data load
+            refresh_data()
             
         except Exception as e:
             self.logger.error(f"Failed to show topics: {str(e)}")
             messagebox.showerror("Error", f"Failed to show topic details: {str(e)}")
+            
+
+    def get_topic_offsets(self, topic, partition):
+        """Get low and high watermarks for a topic partition"""
+        try:
+            consumer = Consumer({
+                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
+                'group.id': f"{self.kafka_entries['group_id'].get()}_monitor"
+            })
+            
+            low, high = consumer.get_watermark_offsets(
+                TopicPartition(topic, partition),
+                timeout=5.0
+            )
+            
+            consumer.close()
+            return low, high
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get offsets: {str(e)}")
+            raise
+        
 
     def monitor_sync_progress(self, rule_name):
         """Monitor synchronization progress"""
@@ -3559,85 +3415,43 @@ class DataIntegrationIDE:
         topic_name = tree.item(selected[0])['values'][1]  # Get topic name from selected row
         self.show_topic_messages(topic_name)
 
-
     def create_neo4j_label(self, label, properties):
         """Create a new label in Neo4j with specified properties"""
         try:
             from neo4j import GraphDatabase
-
-            # Get Neo4j configuration
             config = {key: entry.get() for key, entry in self.neo4j_entries.items()}
             
-            # Connect to Neo4j
             driver = GraphDatabase.driver(
                 config['url'],
                 auth=(config['user'], config['password'])
             )
 
-            # Create label and set properties
             with driver.session() as session:
-                try:
-                    with driver.session() as session:
-                        # Check if label exists first
-                        result = session.run(f"CALL db.labels() YIELD label WHERE label = $label", 
-                                        label=label)
-                        if not result.single():
-                            # Create label if it doesn't exist
-                            session.run(f"CREATE (:{label})")
-                            self.logger.info(f"Created new label: {label}")
-                except Exception as e:
-                    self.logger.error(f"Label creation error: {str(e)}")
-
-
-                # Create constraint for the label if it doesn't exist
-                try:
-                    session.run(f"""
-                        CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label})
-                        REQUIRE n.id IS UNIQUE
-                    """)
-                except Exception as e:
-                    self.logger.warning(f"Failed to create constraint for {label}: {str(e)}")
-
-                # Create a Cypher query that creates the label with properties
+                # First create the label if it doesn't exist
+                session.run(f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label}) REQUIRE n.id IS UNIQUE")
+                
+                # Create initial node with properties
                 property_string = ", ".join([f"n.{key} = ${key}" for key in properties])
                 query = f"""
                     MERGE (n:{label} {{id: $id}})
                     SET {property_string}
                     RETURN n
                 """
-                
                 session.run(query, **properties)
 
             driver.close()
-            self.logger.info(f"Successfully created/updated label {label} in Neo4j")
+            self.logger.info(f"Successfully created/updated label {label}")
             return True
 
         except Exception as e:
             self.logger.error(f"Failed to create Neo4j label: {str(e)}")
             return False
+        
 
-    def process_sink_message(self, message, mapping):
-        """Process a message and sink it to Neo4j"""
+
+    def initialize_neo4j_schema(self, label):
+        """Initialize Neo4j schema for a label"""
         try:
-            data = json.loads(message.value().decode('utf-8'))
-            label = mapping['target']['label']
-            
-            # Prepare properties for Neo4j
-            properties = {}
-            for source_col, target_prop in mapping['columns'].items():
-                if source_col in data:
-                    # Handle different data types appropriately
-                    value = data[source_col]
-                    if isinstance(value, (int, float, str, bool)):
-                        properties[target_prop] = value
-                    else:
-                        properties[target_prop] = str(value)
-            
-            # Add unique ID property if not present
-            if 'id' not in properties:
-                properties['id'] = str(uuid.uuid4())  # Generate unique ID
-
-            # Try to create/update node in Neo4j
             from neo4j import GraphDatabase
             config = {key: entry.get() for key, entry in self.neo4j_entries.items()}
             
@@ -3647,103 +3461,33 @@ class DataIntegrationIDE:
             )
 
             with driver.session() as session:
-                try:
-                    # Try to create node with existing label
-                    property_string = ", ".join([f"n.{key} = ${key}" for key in properties])
-                    query = f"""
-                        MERGE (n:{label} {{id: $id}})
-                        SET {property_string}
-                        RETURN n
-                    """
-                    session.run(query, **properties)
-                    
-                except Exception as e:
-                    if "UnknownLabelWarning" in str(e) or "The provided label is not in the database" in str(e):
-                        # Label doesn't exist, create it
-                        self.logger.info(f"Label {label} not found, creating it...")
-                        if self.create_neo4j_label(label, properties):
-                            self.logger.info(f"Successfully created label {label}")
-                        else:
-                            raise Exception(f"Failed to create label {label}")
-                    else:
-                        raise e
+                # Create constraint for unique IDs
+                session.run(f"""
+                    CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label})
+                    REQUIRE n.id IS UNIQUE
+                """)
+                
+                # Create initial empty node to ensure label exists
+                session.run(f"""
+                    MERGE (n:{label} {{id: 'init'}})
+                    RETURN n
+                """)
 
             driver.close()
             return True
 
         except Exception as e:
-            self.logger.error(f"Failed to process sink message: {str(e)}")
+            self.logger.error(f"Failed to initialize Neo4j schema: {str(e)}")
             return False
-
-    def start_sync_consumer(self, rule_name):
-        """Start consuming messages and sinking to Neo4j"""
-        try:
-            # Load mapping configuration
-            with open(f'mappings/{rule_name}.json', 'r') as f:
-                mapping = json.load(f)
-
-            # Create consumer
-            consumer = Consumer({
-                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
-                'group.id': f"{self.kafka_entries['group_id'].get()}_sink_{rule_name}",
-                'auto.offset.reset': 'earliest'
-            })
-
-            # Subscribe to source topic
-            source_topic = f"{self.kafka_entries['topic_prefix'].get()}_{rule_name}_source"
-            consumer.subscribe([source_topic])
-
-            # Create producer for sink topic
-            producer = Producer({
-                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
-                'client.id': f'sink_producer_{rule_name}'
-            })
-
-            sink_topic = f"{self.kafka_entries['topic_prefix'].get()}_{rule_name}_sink"
-
-            def sync_thread():
-                try:
-                    while True:
-                        msg = consumer.poll(timeout=1.0)
-                        if msg is None:
-                            continue
-
-                        if msg.error():
-                            self.logger.error(f"Consumer error: {msg.error()}")
-                            continue
-
-                        # Process message and sink to Neo4j
-                        if self.process_sink_message(msg, mapping):
-                            # If successful, produce to sink topic
-                            producer.produce(
-                                sink_topic,
-                                key=msg.key(),
-                                value=msg.value()
-                            )
-                            producer.flush()
-
-                            # Update monitoring database
-                            self.update_sync_status(rule_name, 1, 1, 0)
-                        else:
-                            # Update monitoring database with error
-                            self.update_sync_status(rule_name, 1, 0, 1)
-
-                except Exception as e:
-                    self.logger.error(f"Sync thread error: {str(e)}")
-                finally:
-                    consumer.close()
-                    producer.flush()
-
-            # Start sync thread
-            sync_thread = threading.Thread(target=sync_thread, daemon=True)
-            sync_thread.start()
-
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Failed to start sync consumer: {str(e)}")
-            return False
-
+        
+    def delivery_callback(self, err, msg, rule_name):
+        """Callback for message delivery confirmation"""
+        if err:
+            self.logger.error(f'Message delivery failed for rule {rule_name}: {err}')
+            self.update_sync_status(rule_name, 0, 0, 1)
+        else:
+            self.logger.info(f'Message delivered to {msg.topic()} [{msg.partition()}] @ {msg.offset()}')
+            
     def update_sync_status(self, rule_name, processed, success, errors):
         try:
             with sqlite3.connect('monitoring.db') as conn:
@@ -3773,43 +3517,58 @@ class DataIntegrationIDE:
     def start_sync_for_rule(self, rule_name):
         """Start synchronization for a specific rule"""
         try:
-            # Start consumer thread first
-            if not self.start_sync_consumer(rule_name):
-                raise Exception("Failed to start sync consumer")
-
             # Load mapping configuration
             with open(f'mappings/{rule_name}.json', 'r') as f:
                 mapping = json.load(f)
                 
+            # Initialize Neo4j schema first
+            if not self.initialize_neo4j_schema(mapping['target']['label']):
+                raise Exception("Failed to initialize Neo4j schema")
+
+            # Set up topics
+            source_topic = f"{self.kafka_entries['topic_prefix'].get()}_{rule_name}_source"
+            sink_topic = f"{self.kafka_entries['topic_prefix'].get()}_{rule_name}_sink"
+
+            # Create topics if needed
+            self.ensure_topics_exist([source_topic, sink_topic])
+
+            # Start consumer thread first
+            if not self.start_sync_consumer(rule_name):
+                raise Exception("Failed to start sync consumer")
+
             # Create source data producer
             producer = Producer({
                 'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
-                'client.id': f'sync_producer_{rule_name}'
+                'client.id': f'sync_producer_{rule_name}',
+                'acks': 'all',
+                'retries': 3,
+                'delivery.timeout.ms': 10000
             })
             
             # Get source data
             if mapping['source']['type'] == 'postgresql':
                 import psycopg2
+                from psycopg2.extras import RealDictCursor  # Add this import
+                
                 config = {key: entry.get() for key, entry in self.pg_entries.items()}
                 conn = psycopg2.connect(**config)
-                cursor = conn.cursor()
+                cursor = conn.cursor(cursor_factory=RealDictCursor)  # Use RealDictCursor
                 
-                # Get column names first
+                # Get column names
                 cursor.execute(f"""
                     SELECT column_name 
                     FROM information_schema.columns 
                     WHERE table_name = '{mapping['source']['table']}'
                     ORDER BY ordinal_position
                 """)
-                columns = [row[0] for row in cursor.fetchall()]
+                columns = [row['column_name'] for row in cursor.fetchall()]
                 
-                # Get all data from source table
+                # Get all data
                 cursor.execute(f"SELECT * FROM {mapping['source']['table']}")
                 
-                # Process rows in batches
                 batch_size = 1000
-                topic = f"{self.kafka_entries['topic_prefix'].get()}_{rule_name}_source"
                 total_count = 0
+                batch_number = 0
                 
                 while True:
                     rows = cursor.fetchmany(batch_size)
@@ -3817,30 +3576,265 @@ class DataIntegrationIDE:
                         break
                         
                     for row in rows:
-                        # Create message as dictionary
-                        message = dict(zip(columns, row))
-                        
-                        # Produce message
-                        producer.produce(
-                            topic,
-                            key=str(row[0]).encode('utf-8'),  # Assuming first column is key
-                            value=json.dumps(message).encode('utf-8')
-                        )
-                        total_count += 1
-                    
+                        # Convert row to dictionary and handle special types
+                        message = {}
+                        for column, value in row.items():
+                            if value is not None:
+                                if isinstance(value, (datetime, date)):
+                                    value = value.isoformat()
+                                elif isinstance(value, (Decimal, UUID)):
+                                    value = str(value)
+                                elif isinstance(value, bytes):
+                                    value = value.hex()
+                            message[column] = value
+
+                        try:
+                            # Use first column as key, or generate UUID
+                            key = str(row[columns[0]]) if row[columns[0]] is not None else str(uuid.uuid4())
+                            producer.produce(
+                                source_topic,
+                                key=key.encode('utf-8'),
+                                value=json.dumps(message).encode('utf-8'),
+                                on_delivery=lambda err, msg: self.delivery_callback(err, msg, rule_name)
+                            )
+                            total_count += 1
+
+                            # Flush periodically
+                            if total_count % 100 == 0:
+                                producer.flush()
+
+                        except BufferError:
+                            producer.flush()
+                            # Retry the failed message
+                            producer.produce(
+                                source_topic,
+                                key=key.encode('utf-8'),
+                                value=json.dumps(message).encode('utf-8'),
+                                on_delivery=lambda err, msg: self.delivery_callback(err, msg, rule_name)
+                            )
+
+                    batch_number += 1
+                    self.logger.info(f"Processed batch {batch_number} ({total_count} messages so far)")
                     producer.flush()
-                    
+
                 conn.close()
-                
+                producer.flush()  # Final flush
+
                 messagebox.showinfo("Success", 
                     f"Started sync for rule '{rule_name}'\n"
-                    f"Produced {total_count} messages to topic {topic}")
+                    f"Produced {total_count} messages to topic {source_topic}")
+                return True
                 
         except Exception as e:
             self.logger.error(f"Failed to start sync: {str(e)}")
             messagebox.showerror("Error", f"Failed to start sync: {str(e)}")
-
+            return False
         
+
+    def ensure_topics_exist(self, topic_list):
+        """Ensure all required topics exist"""
+        try:
+            from confluent_kafka.admin import AdminClient, NewTopic
+            
+            admin_client = AdminClient({
+                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get()
+            })
+
+            # Get existing topics
+            existing_topics = admin_client.list_topics().topics
+
+            # Configure new topics
+            topic_configs = {
+                'cleanup.policy': 'compact',
+                'retention.ms': '604800000',  # 7 days
+                'delete.retention.ms': '86400000'  # 1 day
+            }
+
+            # Create list of topics that need to be created
+            new_topics = []
+            for topic in topic_list:
+                if topic not in existing_topics:
+                    new_topics.append(NewTopic(
+                        topic,
+                        num_partitions=1,
+                        replication_factor=1,
+                        config=topic_configs
+                    ))
+
+            # Create new topics if needed
+            if new_topics:
+                fs = admin_client.create_topics(new_topics)
+                for topic, f in fs.items():
+                    try:
+                        f.result(timeout=5)
+                        self.logger.info(f"Created topic: {topic}")
+                    except Exception as e:
+                        self.logger.error(f"Failed to create topic {topic}: {str(e)}")
+                        raise
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to ensure topics exist: {str(e)}")
+            raise        
+        
+    def start_sync_consumer(self, rule_name):
+        """Start consuming messages and sinking to Neo4j"""
+        try:
+            # Load mapping configuration
+            with open(f'mappings/{rule_name}.json', 'r') as f:
+                mapping = json.load(f)
+
+            source_topic = f"{self.kafka_entries['topic_prefix'].get()}_{rule_name}_source"
+            sink_topic = f"{self.kafka_entries['topic_prefix'].get()}_{rule_name}_sink"
+
+            # Configure consumer with proper settings
+            consumer = Consumer({
+                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
+                'group.id': f"{self.kafka_entries['group_id'].get()}_sink_{rule_name}",
+                'auto.offset.reset': 'earliest',
+                'enable.auto.commit': False,
+                'max.poll.interval.ms': 300000,  # 5 minutes
+                'session.timeout.ms': 45000,
+                'heartbeat.interval.ms': 15000
+            })
+
+            consumer.subscribe([source_topic])
+
+            # Configure producer
+            producer = Producer({
+                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
+                'client.id': f'sink_producer_{rule_name}',
+                'acks': 'all',
+                'retries': 3
+            })
+
+            def sync_process():
+                try:
+                    while True:
+                        msg = consumer.poll(timeout=1.0)
+                        if msg is None:
+                            continue
+
+                        if msg.error():
+                            self.logger.error(f"Consumer error: {msg.error()}")
+                            continue
+
+                        try:
+                            # Validate message format
+                            is_valid, data = self.validate_kafka_message(msg, mapping)
+                            if not is_valid:
+                                self.logger.error(f"Invalid message format: {data}")
+                                self.update_sync_status(rule_name, 1, 0, 1)
+                                consumer.commit(msg)
+                                continue
+
+                            # Process message
+                            if self.process_sink_message(msg, mapping):
+                                producer.produce(
+                                    sink_topic,
+                                    key=msg.key(),
+                                    value=msg.value(),
+                                    on_delivery=lambda err, msg: self.delivery_callback(err, msg, rule_name)
+                                )
+                                producer.flush()
+                                consumer.commit(msg)
+                                self.update_sync_status(rule_name, 1, 1, 0)
+                            else:
+                                self.update_sync_status(rule_name, 1, 0, 1)
+
+                        except Exception as e:
+                            self.logger.error(f"Error processing message: {str(e)}")
+                            self.update_sync_status(rule_name, 1, 0, 1)
+
+                except Exception as e:
+                    self.logger.error(f"Sync process error: {str(e)}")
+                finally:
+                    consumer.close()
+                    producer.flush()
+
+            # Start sync thread
+            sync_thread = threading.Thread(target=sync_process, daemon=True)
+            sync_thread.start()
+            
+            # Store thread reference
+            self.sync_threads = getattr(self, 'sync_threads', {})
+            self.sync_threads[rule_name] = sync_thread
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to start sync consumer: {str(e)}")
+            return False
+
+    def process_sink_message(self, message, mapping):
+        """Process a message and sink it to Neo4j"""
+        try:
+            # Parse message
+            data = json.loads(message.value().decode('utf-8'))
+            label = mapping['target']['label']
+            
+            # Prepare properties with proper type conversion
+            properties = {}
+            for source_col, target_prop in mapping['columns'].items():
+                if source_col in data:
+                    value = data[source_col]
+                    if isinstance(value, (int, float, str, bool)) and value is not None:
+                        properties[target_prop] = value
+                    elif isinstance(value, (dict, list)):
+                        properties[target_prop] = json.dumps(value)
+                    elif value is not None:
+                        properties[target_prop] = str(value)
+
+            # Ensure ID property
+            if 'id' not in properties:
+                properties['id'] = str(uuid.uuid4())
+
+            # Connect to Neo4j
+            from neo4j import GraphDatabase
+            config = {key: entry.get() for key, entry in self.neo4j_entries.items()}
+            
+            driver = GraphDatabase.driver(
+                config['url'],
+                auth=(config['user'], config['password'])
+            )
+
+            with driver.session() as session:
+                try:
+                    # Create merge query
+                    property_string = ", ".join([f"n.{key} = ${key}" for key in properties])
+                    query = f"""
+                        MERGE (n:{label} {{id: $id}})
+                        SET {property_string}
+                        RETURN n
+                    """
+                    session.run(query, **properties)
+                    
+                except Exception as e:
+                    if "UnknownLabelWarning" in str(e):
+                        # Create label and retry
+                        self.initialize_neo4j_schema(label)
+                        session.run(query, **properties)
+                    else:
+                        raise e
+
+            driver.close()
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to process sink message: {str(e)}")
+            return False
+    
+    
+    def stop_sync_for_rule(self, rule_name):
+        """Stop synchronization for a specific rule"""
+        try:
+            if hasattr(self, 'sync_threads') and rule_name in self.sync_threads:
+                # Thread will terminate when main loop exits
+                self.sync_threads[rule_name] = None
+                self.logger.info(f"Stopped sync for rule {rule_name}")
+        except Exception as e:
+            self.logger.error(f"Failed to stop sync: {str(e)}")
 
 if __name__ == "__main__":
     app = DataIntegrationIDE()

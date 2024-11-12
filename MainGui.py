@@ -1808,84 +1808,140 @@ class DataIntegrationIDE:
             return False
 
     def check_kafka_service_status(self):
-        """Check if Kafka service is running and accessible"""
+        """Check if all Kafka services are running and accessible"""
+        status = {
+            'zookeeper': False,
+            'kafka': False,
+            'schema_registry': False,
+            'connect': False
+        }
+        
         try:
-            status = {
-                'zookeeper': False,
-                'kafka': False,
-                'schema_registry': False,
-                'connect': False
-            }
-            
-            # Check Kafka broker
+            # 1. Check Zookeeper
+            try:
+                import socket
+                zk_host, zk_port = self.kafka_entries['zookeeper'].get().split(':')
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5)
+                result = sock.connect_ex((zk_host, int(zk_port)))
+                sock.close()
+                status['zookeeper'] = (result == 0)
+            except Exception as e:
+                self.logger.error(f"Zookeeper check failed: {str(e)}")
+
+            # 2. Check Kafka Broker
             try:
                 producer = Producer({
                     'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
                     'socket.timeout.ms': 5000,
                     'request.timeout.ms': 5000
                 })
-                # Use flush instead of close
                 producer.flush(timeout=5)
-                # Proper cleanup
                 del producer
                 status['kafka'] = True
             except Exception as e:
-                self.logger.error(f"Kafka check failed: {str(e)}")
+                self.logger.error(f"Kafka broker check failed: {str(e)}")
 
-            # Rest of the checks...
+            # 3. Check Schema Registry
+            try:
+                schema_registry_url = self.kafka_entries['schema_registry'].get()
+                response = requests.get(f"{schema_registry_url}/subjects", timeout=5)
+                status['schema_registry'] = (response.status_code == 200)
+            except Exception as e:
+                self.logger.error(f"Schema Registry check failed: {str(e)}")
+
+            # 4. Check Kafka Connect
+            try:
+                connect_url = self.kafka_entries['connect_rest'].get()
+                response = requests.get(f"{connect_url}/connectors", timeout=5)
+                status['connect'] = (response.status_code == 200)
+            except Exception as e:
+                self.logger.error(f"Kafka Connect check failed: {str(e)}")
+
             return status
-            
+
         except Exception as e:
-            self.logger.error(f"Error checking Kafka service status: {str(e)}")
+            self.logger.error(f"Error checking Kafka services: {str(e)}")
             return {
                 'zookeeper': False,
                 'kafka': False,
                 'schema_registry': False,
                 'connect': False
             }
-        
+
     def show_kafka_status(self):
-        """Display Kafka service status"""
+        """Display Kafka service status with detailed information"""
         status = self.check_kafka_service_status()
         
-        status_frame = ttk.Frame()
         status_window = tk.Toplevel(self.root)
         status_window.title("Kafka Services Status")
         status_window.geometry("400x300")
         
-        # Status indicators
+        # Services configuration details
         services = {
-            'Zookeeper': status['zookeeper'],
-            'Kafka Broker': status['kafka'],
-            'Schema Registry': status['schema_registry'],
-            'Kafka Connect': status['connect']
+            'Zookeeper': {
+                'running': status['zookeeper'],
+                'url': self.kafka_entries['zookeeper'].get(),
+                'description': 'Coordination service'
+            },
+            'Kafka Broker': {
+                'running': status['kafka'],
+                'url': self.kafka_entries['bootstrap_servers'].get(),
+                'description': 'Message broker'
+            },
+            'Schema Registry': {
+                'running': status['schema_registry'],
+                'url': self.kafka_entries['schema_registry'].get(),
+                'description': 'Schema management'
+            },
+            'Kafka Connect': {
+                'running': status['connect'],
+                'url': self.kafka_entries['connect_rest'].get(),
+                'description': 'Integration framework'
+            }
         }
         
-        for i, (service, is_running) in enumerate(services.items()):
+        for i, (service, details) in enumerate(services.items()):
             frame = ttk.Frame(status_window)
             frame.pack(fill='x', padx=20, pady=5)
             
+            # Service name and status
             ttk.Label(frame, text=f"{service}:").pack(side='left')
             
+            # Status indicator (colored circle)
             status_canvas = tk.Canvas(frame, width=12, height=12)
             status_canvas.pack(side='right')
             
-            color = "#2ECC71" if is_running else "#E74C3C"
+            color = "#2ECC71" if details['running'] else "#E74C3C"  # Green if running, red if not
             status_canvas.create_oval(2, 2, 10, 10, fill=color, outline=color)
             
+            # Status text
             status_label = ttk.Label(frame, 
-                text="Running" if is_running else "Not Running")
+                text=f"{'Running' if details['running'] else 'Not Running'}")
             status_label.pack(side='right', padx=5)
+            
+            # URL/Configuration info
+            ttk.Label(frame, text=f"URL: {details['url']}", 
+                    font=('TkDefaultFont', 8)).pack(pady=(0,2))
+            ttk.Label(frame, text=f"({details['description']})", 
+                    font=('TkDefaultFont', 8, 'italic')).pack()
         
         # Add refresh button
         ttk.Button(status_window, text="Refresh Status", 
                 command=lambda: self.refresh_status(status_window)).pack(pady=10)
         
+        # Add detailed connection info
+        if not all(status.values()):
+            ttk.Label(status_window, 
+                    text="⚠️ Some services are not running. Check configurations and ensure all services are started.",
+                    wraplength=350,
+                    foreground='red').pack(pady=10, padx=20)
 
     def refresh_status(self, status_window):
-        """Refresh the status window"""
+        """Refresh the status window with current service states"""
         status_window.destroy()
         self.show_kafka_status()
+
 
     def test_kafka_message(self):
         """Test Kafka by sending and receiving a test message"""
@@ -3520,6 +3576,19 @@ class DataIntegrationIDE:
 
             # Create label and set properties
             with driver.session() as session:
+                try:
+                    with driver.session() as session:
+                        # Check if label exists first
+                        result = session.run(f"CALL db.labels() YIELD label WHERE label = $label", 
+                                        label=label)
+                        if not result.single():
+                            # Create label if it doesn't exist
+                            session.run(f"CREATE (:{label})")
+                            self.logger.info(f"Created new label: {label}")
+                except Exception as e:
+                    self.logger.error(f"Label creation error: {str(e)}")
+
+
                 # Create constraint for the label if it doesn't exist
                 try:
                     session.run(f"""
@@ -3676,21 +3745,30 @@ class DataIntegrationIDE:
             return False
 
     def update_sync_status(self, rule_name, processed, success, errors):
-        """Update sync status in monitoring database"""
         try:
-            conn = sqlite3.connect('monitoring.db')
-            c = conn.cursor()
-            
-            c.execute('''INSERT INTO integration_status 
-                        (timestamp, rule_name, records_processed, success_count, error_count)
-                        VALUES (datetime('now'), ?, ?, ?, ?)''',
-                    (rule_name, processed, success, errors))
-            
-            conn.commit()
-            conn.close()
-            
+            with sqlite3.connect('monitoring.db') as conn:
+                c = conn.cursor()
+                c.execute('''INSERT INTO integration_status 
+                            (timestamp, rule_name, records_processed, 
+                            success_count, error_count, status)
+                            VALUES (datetime('now'), ?, ?, ?, ?, ?)''',
+                        (rule_name, processed, success, errors, 
+                        'ERROR' if errors > 0 else 'SUCCESS'))
+                conn.commit()
         except Exception as e:
-            self.logger.error(f"Failed to update sync status: {str(e)}")
+            self.logger.error(f"Status update failed: {str(e)}")
+
+
+    def validate_kafka_message(self, message, mapping):
+        try:
+            data = json.loads(message.value().decode('utf-8'))
+            required_fields = mapping['columns'].keys()
+            missing_fields = [f for f in required_fields if f not in data]
+            if missing_fields:
+                raise ValueError(f"Missing required fields: {missing_fields}")
+            return True, data
+        except Exception as e:
+            return False, str(e)
 
     def start_sync_for_rule(self, rule_name):
         """Start synchronization for a specific rule"""
