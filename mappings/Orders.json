@@ -1,0 +1,11 @@
+{
+  "source": {
+    "type": "postgresql",
+    "table": "orders"
+  },
+  "target": {
+    "type": "node",
+    "label": "Orders"
+  },
+  "columns": {}
+}

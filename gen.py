@@ -55,6 +55,37 @@ def insert_random_orders(db_config, num_orders=1, interval=2):
         cursor.close()
         conn.close()
 
+
+def create_orders_table(db_config):
+    conn = connect_db(db_config)
+    cursor = conn.cursor()
+    
+    try:
+        # First drop the existing table
+        cursor.execute("""
+            DROP TABLE IF EXISTS orders;
+        """)
+        
+        # Then create the new table
+        cursor.execute("""
+            CREATE TABLE orders (
+                id SERIAL PRIMARY KEY,
+                customer_id INTEGER NOT NULL,
+                order_date TIMESTAMP NOT NULL,
+                status VARCHAR(20) NOT NULL CHECK (status IN ('NEW', 'PROCESSING', 'SHIPPED', 'DELIVERED')),
+                total_amount DECIMAL(10,2) NOT NULL CHECK (total_amount > 0)
+            );
+        """)
+        conn.commit()
+        print("Orders table created successfully")
+    except Exception as e:
+        print(f"Error creating table: {e}")
+        conn.rollback()
+    finally:
+        cursor.close()
+        conn.close()
+
+        
 if __name__ == "__main__":
     print("Loading configuration from db.ini...")
     config = load_config()
@@ -65,6 +96,9 @@ if __name__ == "__main__":
         
     db_config = config['postgresql']
     print(f"Connected to PostgreSQL at {db_config['host']}:{db_config['port']}")
+    
+    # Create table first
+    create_orders_table(db_config)
     
     print("Starting random order insertion...")
     print("Press Ctrl+C to stop")
