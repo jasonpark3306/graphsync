@@ -64,6 +64,14 @@ class DataIntegrationIDE:
                         status TEXT,
                         details TEXT)''')
             
+
+            # Add to init_monitoring_db method:
+            c.execute('''CREATE TABLE IF NOT EXISTS sync_progress
+                        (rule_name TEXT PRIMARY KEY,
+                        last_id INTEGER,
+                        last_sync TEXT,
+                        status TEXT)''')
+            
             # Topic status table
             c.execute('''CREATE TABLE IF NOT EXISTS topic_status
                         (topic_id TEXT PRIMARY KEY,
@@ -73,7 +81,7 @@ class DataIntegrationIDE:
                         status TEXT,
                         last_updated TEXT)''')
             
-            # New table for Kafka action logging
+            # Kafka action logging table
             c.execute('''CREATE TABLE IF NOT EXISTS kafka_actions
                         (action_id TEXT PRIMARY KEY,
                         action_type TEXT,
@@ -84,7 +92,7 @@ class DataIntegrationIDE:
                         details TEXT,
                         error_message TEXT)''')
             
-            # New table for sync operations
+            # Sync operations table
             c.execute('''CREATE TABLE IF NOT EXISTS sync_operations
                         (sync_id TEXT PRIMARY KEY,
                         rule_name TEXT,
@@ -96,6 +104,17 @@ class DataIntegrationIDE:
                         success_count INTEGER,
                         error_count INTEGER,
                         details TEXT)''')
+
+            # Message logs table
+            c.execute('''CREATE TABLE IF NOT EXISTS message_logs
+                        (log_id TEXT PRIMARY KEY,
+                        timestamp TEXT,
+                        topic TEXT,
+                        key TEXT,
+                        message_type TEXT,
+                        content TEXT,
+                        offset INTEGER,
+                        partition INTEGER)''')
                         
             conn.commit()
             conn.close()
@@ -104,6 +123,195 @@ class DataIntegrationIDE:
         except Exception as e:
             self.logger.error(f"Failed to initialize monitoring database: {str(e)}")
             messagebox.showerror("Error", "Failed to initialize monitoring database")
+
+
+    def log_message(self, topic, key, value, message_type="UNKNOWN", offset=None, partition=None):
+        """Log message to database with enhanced information"""
+        try:
+            conn = sqlite3.connect('monitoring.db')
+            c = conn.cursor()
+            
+            c.execute('''INSERT INTO message_logs 
+                        (log_id, timestamp, topic, key, message_type, content, offset, partition)
+                        VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?)''',
+                    (str(uuid.uuid4()), topic, key, message_type, value, offset, partition))
+            
+            conn.commit()
+            conn.close()
+            
+            # Update log viewer if it exists
+            if hasattr(self, 'log_viewer'):
+                self.refresh_log_viewer(
+                    self.log_viewer['kafka_tree'],
+                    self.log_viewer['message_tree']
+                )
+                
+        except Exception as e:
+            self.logger.error(f"Failed to log message: {str(e)}")
+
+    def delivery_callback(self, err, msg, rule_name):
+        """Callback for message delivery confirmation"""
+        if err:
+            self.logger.error(f'Message delivery failed for rule {rule_name}: {err}')
+            self.update_sync_status(rule_name, 0, 0, 1)
+        else:
+            self.logger.info(f'Message delivered to {msg.topic()} [{msg.partition()}] @ {msg.offset()}')
+            # Log the message with additional information
+            try:
+                message_type = "SOURCE" if "_source" in msg.topic() else "SINK"
+                self.log_message(
+                    msg.topic(),
+                    msg.key().decode('utf-8') if msg.key() else None,
+                    msg.value().decode('utf-8'),
+                    message_type,
+                    msg.offset(),
+                    msg.partition()
+                )
+            except Exception as e:
+                self.logger.error(f"Failed to log message: {str(e)}")
+                
+    def create_log_viewer(self):
+        """Create a log viewer window"""
+        log_window = tk.Toplevel(self.root)
+        log_window.title("Integration Log Viewer")
+        log_window.geometry("1000x600")
+
+        # Create main frame
+        main_frame = ttk.Frame(log_window)
+        main_frame.pack(fill='both', expand=True, padx=10, pady=10)
+
+        # Create notebook for different log views
+        notebook = ttk.Notebook(main_frame)
+        notebook.pack(fill='both', expand=True)
+
+        # Create frames for different types of logs
+        kafka_frame = ttk.Frame(notebook)
+        message_frame = ttk.Frame(notebook)
+        
+        notebook.add(kafka_frame, text="Kafka Actions")
+        notebook.add(message_frame, text="Messages")
+
+        # Kafka Actions Tree
+        kafka_tree = ttk.Treeview(kafka_frame, 
+                                columns=("timestamp", "action", "rule", "topic", "status"),
+                                show='headings')
+        
+        kafka_tree.heading("timestamp", text="Timestamp")
+        kafka_tree.heading("action", text="Action")
+        kafka_tree.heading("rule", text="Rule Name")
+        kafka_tree.heading("topic", text="Topic")
+        kafka_tree.heading("status", text="Status")
+
+        kafka_scroll = ttk.Scrollbar(kafka_frame, orient="vertical", command=kafka_tree.yview)
+        kafka_tree.configure(yscrollcommand=kafka_scroll.set)
+        
+        kafka_tree.pack(side='left', fill='both', expand=True)
+        kafka_scroll.pack(side='right', fill='y')
+
+        # Messages Tree and JSON Viewer
+        paned = ttk.PanedWindow(message_frame, orient='vertical')
+        paned.pack(fill='both', expand=True)
+
+        # Upper frame for message list
+        upper_frame = ttk.Frame(paned)
+        message_tree = ttk.Treeview(upper_frame, 
+                                columns=("timestamp", "topic", "key", "type"),
+                                show='headings')
+        
+        message_tree.heading("timestamp", text="Timestamp")
+        message_tree.heading("topic", text="Topic")
+        message_tree.heading("key", text="Key")
+        message_tree.heading("type", text="Type")
+
+        message_scroll = ttk.Scrollbar(upper_frame, orient="vertical", command=message_tree.yview)
+        message_tree.configure(yscrollcommand=message_scroll.set)
+        
+        message_tree.pack(side='left', fill='both', expand=True)
+        message_scroll.pack(side='right', fill='y')
+        
+        paned.add(upper_frame)
+
+        # Lower frame for JSON content
+        lower_frame = ttk.Frame(paned)
+        json_text = tk.Text(lower_frame, wrap=tk.WORD, height=10)
+        json_text.pack(fill='both', expand=True)
+        
+        paned.add(lower_frame)
+
+        # Bind selection event
+        def on_message_select(event):
+            selected = message_tree.selection()
+            if not selected:
+                return
+            
+            item = message_tree.item(selected[0])
+            try:
+                message_data = item['values'][4]  # Store JSON data in hidden column
+                formatted_json = json.dumps(json.loads(message_data), indent=2)
+                json_text.delete('1.0', tk.END)
+                json_text.insert('1.0', formatted_json)
+            except:
+                json_text.delete('1.0', tk.END)
+                json_text.insert('1.0', "Invalid JSON data")
+
+        message_tree.bind('<<TreeviewSelect>>', on_message_select)
+
+        # Add control buttons
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill='x', pady=(10,0))
+
+        ttk.Button(button_frame, text="Refresh", 
+                command=lambda: self.refresh_log_viewer(kafka_tree, message_tree)).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="Clear", 
+                command=lambda: self.clear_log_viewer(kafka_tree, message_tree)).pack(side='left', padx=5)
+
+        # Store references
+        self.log_viewer = {
+            'window': log_window,
+            'kafka_tree': kafka_tree,
+            'message_tree': message_tree,
+            'json_text': json_text
+        }
+        
+        # Initial load
+        self.refresh_log_viewer(kafka_tree, message_tree)
+
+    def refresh_log_viewer(self, kafka_tree, message_tree):
+        """Refresh log viewer contents"""
+        # Clear existing items
+        kafka_tree.delete(*kafka_tree.get_children())
+        message_tree.delete(*message_tree.get_children())
+
+        try:
+            conn = sqlite3.connect('monitoring.db')
+            c = conn.cursor()
+
+            # Get Kafka actions
+            c.execute('''SELECT timestamp, action_type, rule_name, topic_name, status 
+                        FROM kafka_actions 
+                        ORDER BY timestamp DESC''')
+            
+            for row in c.fetchall():
+                kafka_tree.insert('', 'end', values=row)
+
+            # Get messages from message_logs table
+            c.execute('''SELECT timestamp, topic, key, message_type, content 
+                        FROM message_logs 
+                        ORDER BY timestamp DESC''')
+            
+            for row in c.fetchall():
+                message_tree.insert('', 'end', values=row)
+
+            conn.close()
+
+        except Exception as e:
+            self.logger.error(f"Failed to refresh log viewer: {str(e)}")
+
+    def clear_log_viewer(self, kafka_tree, message_tree):
+        """Clear log viewer contents"""
+        kafka_tree.delete(*kafka_tree.get_children())
+        message_tree.delete(*message_tree.get_children())
+        
 
     def log_kafka_action(self, action_type, rule_name, topic_name=None, status="SUCCESS", details=None, error_message=None):
         """Log Kafka-related actions to the database"""
@@ -159,12 +367,17 @@ class DataIntegrationIDE:
             
         except Exception as e:
             self.logger.error(f"Failed to track sync operation: {str(e)}")
-            
+                    
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Data Integration IDE")
         self.current_step = 0
         self.config = configparser.ConfigParser()
+        
+        # Add thread management
+        self.source_threads = {}
+        self.sink_threads = {}
+        self.thread_stop_flags = {}
         
         # Setup logging
         logging.basicConfig(
@@ -173,11 +386,252 @@ class DataIntegrationIDE:
         )
         self.logger = logging.getLogger(__name__)
         
-        # Initialize database
-        self.init_monitoring_db()  # Add this line
-        
+        self.init_monitoring_db()
         self.load_config()
         self.setup_ui()
+
+    def start_background_threads(self, rule_name):
+        """Start background threads for source and sink processing"""
+        try:
+            # Set stop flag for this rule
+            self.thread_stop_flags[rule_name] = False
+            
+            # Start source thread
+            source_thread = threading.Thread(
+                target=self.source_thread_process,
+                args=(rule_name,),
+                daemon=True
+            )
+            self.source_threads[rule_name] = source_thread
+            source_thread.start()
+            
+            # Start sink thread
+            sink_thread = threading.Thread(
+                target=self.sink_thread_process,
+                args=(rule_name,),
+                daemon=True
+            )
+            self.sink_threads[rule_name] = sink_thread
+            sink_thread.start()
+            
+            self.logger.info(f"Started background threads for rule: {rule_name}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to start background threads: {str(e)}")
+            return False
+
+
+    def source_thread_process(self, rule_name):
+        """Continuous source processing thread"""
+        try:
+            # Load mapping configuration
+            with open(f'mappings/{rule_name}.json', 'r') as f:
+                mapping = json.load(f)
+            
+            source_topic = f"{self.kafka_entries['topic_prefix'].get()}_{rule_name}_source"
+            producer = Producer({
+                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
+                'client.id': f'source_producer_{rule_name}',
+                'acks': 'all'
+            })
+            
+            # Get or initialize last processed ID
+            conn = sqlite3.connect('monitoring.db')
+            c = conn.cursor()
+            c.execute('SELECT last_id FROM sync_progress WHERE rule_name = ?', (rule_name,))
+            result = c.fetchone()
+            last_processed_id = result[0] if result else 0
+            conn.close()
+
+            while not self.thread_stop_flags.get(rule_name, True):
+                try:
+                    if mapping['source']['type'] == 'postgresql':
+                        import psycopg2
+                        from psycopg2.extras import RealDictCursor
+                        
+                        config = {key: entry.get() for key, entry in self.pg_entries.items()}
+                        conn = psycopg2.connect(**config)
+                        cursor = conn.cursor(cursor_factory=RealDictCursor)
+                        
+                        # Query for new records only
+                        cursor.execute(f"""
+                            SELECT * FROM {mapping['source']['table']}
+                            WHERE id > %s
+                            ORDER BY id
+                            LIMIT 1000
+                        """, (last_processed_id,))
+                        
+                        rows = cursor.fetchall()
+                        if rows:
+                            for row in rows:
+                                message = self.prepare_message(row)
+                                if message:
+                                    try:
+                                        key = str(row['id'])
+                                        producer.produce(
+                                            source_topic,
+                                            key=key.encode('utf-8'),
+                                            value=json.dumps(message).encode('utf-8'),
+                                            on_delivery=lambda err, msg: self.delivery_callback(err, msg, rule_name)
+                                        )
+                                        last_processed_id = row['id']
+                                    except Exception as e:
+                                        self.logger.error(f"Error producing message: {str(e)}")
+                                        
+                            producer.flush()
+                            
+                            # Update progress in database
+                            conn_monitor = sqlite3.connect('monitoring.db')
+                            c = conn_monitor.cursor()
+                            c.execute('''INSERT OR REPLACE INTO sync_progress 
+                                        (rule_name, last_id, last_sync, status)
+                                        VALUES (?, ?, datetime('now'), ?)''',
+                                    (rule_name, last_processed_id, 'RUNNING'))
+                            conn_monitor.commit()
+                            conn_monitor.close()
+                        
+                        conn.close()
+                    
+                    # Sleep before next check (adjust interval as needed)
+                    time.sleep(5)  # Check every 5 seconds
+                    
+                except Exception as e:
+                    self.logger.error(f"Error in source thread: {str(e)}")
+                    time.sleep(5)  # Sleep before retry
+                    
+        except Exception as e:
+            self.logger.error(f"Source thread failed: {str(e)}")
+        finally:
+            if 'producer' in locals():
+                producer.flush()
+
+
+    def get_sync_status(self, rule_name):
+        """Get current sync status for a rule"""
+        try:
+            conn = sqlite3.connect('monitoring.db')
+            c = conn.cursor()
+            c.execute('''SELECT last_id, last_sync, status 
+                        FROM sync_progress 
+                        WHERE rule_name = ?''', (rule_name,))
+            result = c.fetchone()
+            conn.close()
+            
+            if result:
+                return {
+                    'last_id': result[0],
+                    'last_sync': result[1],
+                    'status': result[2]
+                }
+            return None
+        except Exception as e:
+            self.logger.error(f"Failed to get sync status: {str(e)}")
+            return None
+                
+    def prepare_message(self, row):
+        """Prepare message from database row with type handling"""
+        try:
+            message = {}
+            for column, value in row.items():
+                if value is not None:
+                    if isinstance(value, (datetime, date)):
+                        value = value.isoformat()
+                    elif isinstance(value, (Decimal, UUID)):
+                        value = str(value)
+                    elif isinstance(value, bytes):
+                        value = value.hex()
+                    elif isinstance(value, dict):
+                        value = json.dumps(value)
+                    else:
+                        value = str(value)
+                message[column] = value
+            return message
+        except Exception as e:
+            self.logger.error(f"Error preparing message: {str(e)}")
+            return None
+
+
+    def sink_thread_process(self, rule_name):
+        """Continuous sink processing thread"""
+        try:
+            # Load mapping configuration
+            with open(f'mappings/{rule_name}.json', 'r') as f:
+                mapping = json.load(f)
+            
+            source_topic = f"{self.kafka_entries['topic_prefix'].get()}_{rule_name}_source"
+            sink_topic = f"{self.kafka_entries['topic_prefix'].get()}_{rule_name}_sink"
+            
+            consumer = Consumer({
+                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
+                'group.id': f"{self.kafka_entries['group_id'].get()}_sink_{rule_name}",
+                'auto.offset.reset': 'earliest',
+                'enable.auto.commit': False
+            })
+            
+            consumer.subscribe([source_topic])
+            
+            producer = Producer({
+                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
+                'client.id': f'sink_producer_{rule_name}'
+            })
+            
+            while not self.thread_stop_flags.get(rule_name, True):
+                try:
+                    msg = consumer.poll(timeout=1.0)
+                    if msg is None:
+                        continue
+                    
+                    if msg.error():
+                        self.logger.error(f"Consumer error: {msg.error()}")
+                        continue
+                    
+                    # Process message
+                    if self.process_sink_message(msg, mapping):
+                        producer.produce(
+                            sink_topic,
+                            key=msg.key(),
+                            value=msg.value(),
+                            on_delivery=lambda err, msg: self.delivery_callback(err, msg, rule_name)
+                        )
+                        producer.flush()
+                        consumer.commit(msg)
+                        
+                except Exception as e:
+                    self.logger.error(f"Error in sink thread: {str(e)}")
+                    time.sleep(5)  # Sleep before retry
+                    
+        except Exception as e:
+            self.logger.error(f"Sink thread failed: {str(e)}")
+        finally:
+            consumer.close()
+            producer.flush()
+
+    def stop_background_threads(self, rule_name):
+        """Stop background threads for a rule"""
+        try:
+            self.thread_stop_flags[rule_name] = True
+            
+            if rule_name in self.source_threads:
+                self.source_threads[rule_name] = None
+                
+            if rule_name in self.sink_threads:
+                self.sink_threads[rule_name] = None
+                
+            # Update status in database
+            conn = sqlite3.connect('monitoring.db')
+            c = conn.cursor()
+            c.execute('''UPDATE sync_progress 
+                        SET status = 'STOPPED'
+                        WHERE rule_name = ?''', (rule_name,))
+            conn.commit()
+            conn.close()
+                
+            self.logger.info(f"Stopped background threads for rule: {rule_name}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to stop background threads: {str(e)}")
+            
         
     def load_config(self):
         """Load configuration from db.ini file"""
@@ -843,56 +1297,140 @@ class DataIntegrationIDE:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to get topic status: {str(e)}")
 
-    def show_topic_messages(self, topic):
-        """Show recent messages in topic"""
+    def show_topic_messages(self, topic_name):
+        """Show messages in topic with improved message retrieval"""
+        if not topic_name:
+            messagebox.showwarning("Warning", "Please select a topic to view messages")
+            return
+            
         try:
-            consumer = Consumer({
-                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
-                'group.id': f"{self.kafka_entries['group_id'].get()}_view",
-                'auto.offset.reset': 'earliest'
-            })
-            
-            consumer.subscribe([topic])
-            
             # Create message viewer window
             viewer = tk.Toplevel(self.root)
-            viewer.title(f"Messages in {topic}")
-            viewer.geometry("600x400")
+            viewer.title(f"Messages in {topic_name}")
+            viewer.geometry("800x600")
+
+            # Create main frame
+            main_frame = ttk.Frame(viewer)
+            main_frame.pack(fill='both', expand=True, padx=10, pady=10)
+
+            # Create message tree
+            columns = ("offset", "timestamp", "key", "value")
+            tree = ttk.Treeview(main_frame, columns=columns, show='headings', height=10)
             
-            # Message display
-            text_widget = tk.Text(viewer, wrap=tk.WORD, padx=10, pady=10)
-            text_widget.pack(fill='both', expand=True)
+            for col in columns:
+                tree.heading(col, text=col.title())
+                tree.column(col, width=150)
+
+            # Add scrollbars
+            y_scroll = ttk.Scrollbar(main_frame, orient='vertical', command=tree.yview)
+            tree.configure(yscrollcommand=y_scroll.set)
             
-            # Get messages (last 10)
+            tree.pack(side='left', fill='both', expand=True)
+            y_scroll.pack(side='right', fill='y')
+
+            # Add JSON preview pane
+            preview_frame = ttk.LabelFrame(viewer, text="Message Content")
+            preview_frame.pack(fill='both', expand=True, padx=10, pady=(5, 10))
+            
+            preview_text = tk.Text(preview_frame, wrap=tk.WORD, height=10)
+            preview_text.pack(fill='both', expand=True)
+
+            # Create consumer with specific configuration
+            consumer = Consumer({
+                'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
+                'group.id': f"{self.kafka_entries['group_id'].get()}_view_{int(time.time())}",  # Unique group ID
+                'auto.offset.reset': 'earliest',
+                'enable.auto.commit': False
+            })
+
+            # Assign specific partitions
+            partitions = [TopicPartition(topic_name, 0)]  # Assuming partition 0
+            consumer.assign(partitions)
+            
+            # Seek to beginning
+            consumer.seek_to_beginning(partitions[0])
+            
             messages = []
-            while len(messages) < 10:
+            timeout = 5.0  # 5 seconds timeout
+            start_time = time.time()
+
+            # Collect messages
+            while time.time() - start_time < timeout:
                 msg = consumer.poll(timeout=1.0)
                 if msg is None:
-                    break
-                if not msg.error():
+                    continue
+                
+                if msg.error():
+                    self.logger.error(f"Consumer error: {msg.error()}")
+                    continue
+                    
+                # Parse message
+                try:
+                    key = msg.key().decode('utf-8') if msg.key() else "None"
+                    value = msg.value().decode('utf-8') if msg.value() else "None"
+                    
+                    # Try to pretty print JSON
+                    try:
+                        value_obj = json.loads(value)
+                        value = json.dumps(value_obj, indent=2)
+                    except:
+                        pass
+
                     messages.append({
-                        'timestamp': msg.timestamp()[1],
-                        'key': msg.key().decode('utf-8') if msg.key() else None,
-                        'value': json.loads(msg.value().decode('utf-8'))
+                        'offset': msg.offset(),
+                        'timestamp': datetime.fromtimestamp(msg.timestamp()[1]/1000).strftime('%Y-%m-%d %H:%M:%S'),
+                        'key': key,
+                        'value': value
                     })
-            
-            if messages:
-                for msg in messages:
-                    text_widget.insert('end', 
-                        f"Timestamp: {msg['timestamp']}\n"
-                        f"Key: {msg['key']}\n"
-                        f"Value: {json.dumps(msg['value'], indent=2)}\n"
-                        f"{'-'*60}\n\n"
-                    )
-            else:
-                text_widget.insert('end', "No messages found in topic")
-            
+                except Exception as e:
+                    self.logger.error(f"Error parsing message: {str(e)}")
+
             consumer.close()
-            
+
+            # Insert messages into tree
+            for msg in messages:
+                item_id = tree.insert('', 'end', values=(
+                    msg['offset'],
+                    msg['timestamp'],
+                    msg['key'],
+                    "Click to view"  # Placeholder for value
+                ))
+                # Store full value in item
+                tree.set(item_id, 'value_full', msg['value'])
+
+            # Handle selection
+            def on_select(event):
+                selected = tree.selection()
+                if not selected:
+                    return
+                
+                # Get the full value and display it
+                item = tree.item(selected[0])
+                value = tree.set(selected[0], 'value_full')
+                
+                preview_text.delete('1.0', tk.END)
+                preview_text.insert('1.0', value)
+
+            tree.bind('<<TreeviewSelect>>', on_select)
+
+            # Add refresh button
+            ttk.Button(viewer, text="Refresh", 
+                    command=lambda: self.refresh_messages(tree, topic_name)).pack(pady=5)
+
+            # Show message if no messages found
+            if not messages:
+                messagebox.showinfo("Info", "No messages found in topic")
+
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to read topic messages: {str(e)}")
+            self.logger.error(f"Failed to show messages: {str(e)}")
+            messagebox.showerror("Error", f"Failed to show messages: {str(e)}")
 
-
+    def refresh_messages(self, tree, topic_name):
+        """Refresh messages in the tree"""
+        # Clear existing items
+        tree.delete(*tree.get_children())
+        self.show_topic_messages(topic_name)
+        
     def create_monitoring(self):
         frame = ttk.Frame(self.notebook)
         
@@ -960,6 +1498,9 @@ class DataIntegrationIDE:
                 )).pack(side='left', padx=5)
         ttk.Button(control_frame, text="View Action History", 
                 command=self.show_action_history).pack(side='left', padx=5)
+        # Add this to the create_monitoring method, in the control_frame
+        ttk.Button(control_frame, text="Show Log Viewer", 
+                command=self.create_log_viewer).pack(side='left', padx=5)
 
         return frame
 
@@ -1102,6 +1643,10 @@ class DataIntegrationIDE:
                 )).pack(side='left', padx=5)
         ttk.Button(left_buttons_frame, text="View Action History", 
                 command=self.show_action_history).pack(side='left', padx=5)
+        
+        # Add this to the create_monitoring method, in the control_frame
+        ttk.Button(control_frame, text="Show Log Viewer", 
+               command=self.create_log_viewer).pack(side='left', padx=5)
 
         return frame
 
@@ -3139,6 +3684,12 @@ class DataIntegrationIDE:
                             "Error"
                         ))
 
+            # Add to the refresh_data function in show_rule_topics:
+            sync_status = self.get_sync_status(rule_name)
+            if sync_status:
+                ttk.Label(status_frame, text=f"Last Sync: {sync_status['last_sync']}\n"
+                                            f"Status: {sync_status['status']}").pack()
+                
             # Add buttons at the bottom
             ttk.Button(button_frame, text="Refresh", 
                     command=refresh_data).pack(side='left', padx=5)
@@ -3149,6 +3700,14 @@ class DataIntegrationIDE:
                     )).pack(side='left', padx=5)
             ttk.Button(button_frame, text="Start Sync",
                     command=lambda: self.start_sync_for_rule(rule_name)).pack(side='left', padx=5)
+            
+            # Add start/stop buttons
+            ttk.Button(button_frame, text="Start Processing",
+                    command=lambda: self.start_background_threads(rule_name)).pack(side='left', padx=5)
+            ttk.Button(button_frame, text="Stop Processing",
+                    command=lambda: self.stop_background_threads(rule_name)).pack(side='left', padx=5)
+            
+
 
             # Initial data load
             refresh_data()
@@ -3156,14 +3715,26 @@ class DataIntegrationIDE:
         except Exception as e:
             self.logger.error(f"Failed to show topics: {str(e)}")
             messagebox.showerror("Error", f"Failed to show topic details: {str(e)}")
-            
 
+    def check_thread_status(self, rule_name):
+        """Check if threads are running for a rule"""
+        source_running = (rule_name in self.source_threads and 
+                        self.source_threads[rule_name] is not None and 
+                        self.source_threads[rule_name].is_alive())
+        
+        sink_running = (rule_name in self.sink_threads and 
+                    self.sink_threads[rule_name] is not None and 
+                    self.sink_threads[rule_name].is_alive())
+        
+        return source_running, sink_running
+
+                
     def get_topic_offsets(self, topic, partition):
         """Get low and high watermarks for a topic partition"""
         try:
             consumer = Consumer({
                 'bootstrap.servers': self.kafka_entries['bootstrap_servers'].get(),
-                'group.id': f"{self.kafka_entries['group_id'].get()}_monitor"
+                'group.id': f"{self.kafka_entries['group_id'].get()}_offset_check"
             })
             
             low, high = consumer.get_watermark_offsets(
@@ -3176,8 +3747,7 @@ class DataIntegrationIDE:
             
         except Exception as e:
             self.logger.error(f"Failed to get offsets: {str(e)}")
-            raise
-        
+            return 0, 0
 
     def monitor_sync_progress(self, rule_name):
         """Monitor synchronization progress"""
@@ -3298,15 +3868,7 @@ class DataIntegrationIDE:
         except Exception as e:
             self.logger.error(f"Failed to initialize Neo4j schema: {str(e)}")
             return False
-        
-    def delivery_callback(self, err, msg, rule_name):
-        """Callback for message delivery confirmation"""
-        if err:
-            self.logger.error(f'Message delivery failed for rule {rule_name}: {err}')
-            self.update_sync_status(rule_name, 0, 0, 1)
-        else:
-            self.logger.info(f'Message delivered to {msg.topic()} [{msg.partition()}] @ {msg.offset()}')
-            
+                   
     def update_sync_status(self, rule_name, processed, success, errors):
         try:
             with sqlite3.connect('monitoring.db') as conn:
