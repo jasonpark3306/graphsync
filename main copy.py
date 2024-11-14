@@ -576,67 +576,6 @@ class DataIntegrationIDE:
             self.logger.error(f"Error preparing message: {str(e)}")
             return None
 
-    def process_sink_message(self, message, mapping, rule_name):
-        """Process a message and sink it to Neo4j"""
-        try:
-            # Parse message
-            data = json.loads(message.value().decode('utf-8'))
-            label = mapping['target']['label']
-            
-            # Prepare properties with proper type conversion
-            properties = {}
-            for source_col, target_prop in mapping['columns'].items():
-                if source_col in data:
-                    value = data[source_col]
-                    if isinstance(value, (int, float, str, bool)) and value is not None:
-                        properties[target_prop] = value
-                    elif isinstance(value, (dict, list)):
-                        properties[target_prop] = json.dumps(value)
-                    elif value is not None:
-                        properties[target_prop] = str(value)
-
-            # Ensure ID property
-            if 'id' not in properties:
-                properties['id'] = str(uuid.uuid4())
-
-            # Connect to Neo4j
-            from neo4j import GraphDatabase
-            config = {key: entry.get() for key, entry in self.neo4j_entries.items()}
-            
-            driver = GraphDatabase.driver(
-                config['url'],
-                auth=(config['user'], config['password'])
-            )
-
-            with driver.session() as session:
-                try:
-                    # Create merge query
-                    property_string = ", ".join([f"n.{key} = ${key}" for key in properties])
-                    query = f"""
-                        MERGE (n:{label} {{id: $id}})
-                        SET {property_string}
-                        RETURN n
-                    """
-                    session.run(query, **properties)
-                    
-                except Exception as e:
-                    if "UnknownLabelWarning" in str(e):
-                        # Create label and retry
-                        self.initialize_neo4j_schema(label)
-                        session.run(query, **properties)
-                    else:
-                        raise e
-
-            driver.close()
-            # Update counters on success
-            self.update_status_counts(rule_name, processed=1, success=1)
-            return True
-
-        except Exception as e:
-            # Update counters on error
-            self.update_status_counts(rule_name, processed=1, errors=1)
-            self.logger.error(f"Failed to process sink message: {str(e)}")
-            return False
 
     def sink_thread_process(self, rule_name):
         """Continuous sink processing thread"""
@@ -673,7 +612,7 @@ class DataIntegrationIDE:
                         continue
                     
                     # Process message
-                    if self.process_sink_message(msg, mapping, rule_name):  # Pass rule_name here
+                    if self.process_sink_message(msg, mapping):
                         producer.produce(
                             sink_topic,
                             key=msg.key(),
@@ -693,7 +632,6 @@ class DataIntegrationIDE:
             consumer.close()
             producer.flush()
 
-            
     def stop_background_threads(self, rule_name):
         """Stop background threads for a rule"""
         try:
@@ -1592,6 +1530,15 @@ class DataIntegrationIDE:
         return frame
 
 
+    def start_auto_refresh(self):
+        """Start auto-refresh for monitoring"""
+        def refresh_loop():
+            if self.auto_refresh_var.get():
+                self.refresh_monitoring()
+            self.root.after(5000, refresh_loop)  # Refresh every 5 seconds
+        
+        refresh_loop()
+        
     def setup_kafka_config(self):
         """Initialize Kafka configuration"""
         self.kafka_config = {
@@ -1614,37 +1561,6 @@ class DataIntegrationIDE:
         self.start_monitoring()
 
 
-    def start_auto_refresh(self):
-        """Start auto-refresh for monitoring"""
-        def refresh_loop():
-            if self.auto_refresh_var.get():
-                self.refresh_monitoring()
-            self.root.after(2000, refresh_loop)  # Refresh every 2 seconds
-        refresh_loop()
-
-    def update_status_counts(self, rule_name, processed=0, success=0, errors=0):
-        """Update processing counts in database"""
-        try:
-            with sqlite3.connect('monitoring.db') as conn:
-                c = conn.cursor()
-                status_id = str(uuid.uuid4())
-                now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                
-                c.execute('''INSERT INTO integration_status 
-                            (status_id, timestamp, rule_name, records_processed, 
-                            success_count, error_count, status)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                        (status_id, now, rule_name, processed, success, errors, 
-                        'ERROR' if errors > 0 else 'SUCCESS'))
-                conn.commit()
-                
-            # If auto-refresh is on, refresh the display
-            if hasattr(self, 'auto_refresh_var') and self.auto_refresh_var.get():
-                self.refresh_monitoring()
-                
-        except Exception as e:
-            self.logger.error(f"Failed to update status counts: {str(e)}")
-            
     def monitor_topics(self):
         """Monitor Kafka topics and update status"""
         try:
@@ -1685,132 +1601,79 @@ class DataIntegrationIDE:
     def create_monitoring(self):
         frame = ttk.Frame(self.notebook)
         
-        # Main container with proper scrolling
-        main_container = ttk.Frame(frame)
-        main_container.pack(fill='both', expand=True, padx=10, pady=10)
+        # Create main layout with three panes
+        paned = ttk.PanedWindow(frame, orient='vertical')
+        paned.pack(fill='both', expand=True, padx=10, pady=10)
         
-        # Create vertical scrollbar for the whole container
-        main_scrollbar = ttk.Scrollbar(main_container)
-        main_scrollbar.pack(side='right', fill='y')
+        # Top frame for deployed rules
+        rules_frame = ttk.LabelFrame(paned, text="Deployed Mapping Rules")
+        paned.add(rules_frame)
         
-        # Create canvas for scrolling
-        canvas = tk.Canvas(main_container, yscrollcommand=main_scrollbar.set)
-        canvas.pack(side='left', fill='both', expand=True)
-        main_scrollbar.config(command=canvas.yview)
-        
-        # Frame inside canvas for content
-        content_frame = ttk.Frame(canvas)
-        canvas.create_window((0, 0), window=content_frame, anchor='nw')
-        
-        # Deployed Rules section
-        rules_frame = ttk.LabelFrame(content_frame, text="Deployed Mapping Rules")
-        rules_frame.pack(fill='x', padx=5, pady=5)
-        
-        # Rules Treeview with horizontal scrollbar
-        rules_tree_frame = ttk.Frame(rules_frame)
-        rules_tree_frame.pack(fill='both', expand=True)
-        
-        self.rules_tree = ttk.Treeview(rules_tree_frame, 
+        # Rules Treeview
+        self.rules_tree = ttk.Treeview(rules_frame, 
                                     columns=("rule", "source", "target", "topic", "status"),
                                     show='headings',
                                     height=6)
-        
-        # Add horizontal scrollbar for rules tree
-        rules_x_scroll = ttk.Scrollbar(rules_tree_frame, orient='horizontal', 
-                                    command=self.rules_tree.xview)
-        rules_y_scroll = ttk.Scrollbar(rules_tree_frame, orient='vertical', 
-                                    command=self.rules_tree.yview)
-        
-        self.rules_tree.configure(xscrollcommand=rules_x_scroll.set, 
-                                yscrollcommand=rules_y_scroll.set)
-        
-        # Configure column headings and widths
         self.rules_tree.heading("rule", text="Rule Name")
         self.rules_tree.heading("source", text="Source")
         self.rules_tree.heading("target", text="Target")
         self.rules_tree.heading("topic", text="Kafka Topic")
         self.rules_tree.heading("status", text="Status")
         
-        # Set minimum column widths
-        for col in ("rule", "source", "target", "topic", "status"):
-            self.rules_tree.column(col, width=150, minwidth=100)
+        # Add scrollbar to rules tree
+        rules_scroll = ttk.Scrollbar(rules_frame, orient="vertical", command=self.rules_tree.yview)
+        self.rules_tree.configure(yscrollcommand=rules_scroll.set)
         
-        # Pack rules tree and scrollbars
+        # Pack rules tree and scrollbar
         self.rules_tree.pack(side='left', fill='both', expand=True)
-        rules_y_scroll.pack(side='right', fill='y')
-        rules_x_scroll.pack(side='bottom', fill='x')
+        rules_scroll.pack(side='right', fill='y')
         
-        # Synchronization Status section
-        status_frame = ttk.LabelFrame(content_frame, text="Synchronization Status")
-        status_frame.pack(fill='x', padx=5, pady=5)
+        # Bottom frame for sync status
+        status_frame = ttk.LabelFrame(paned, text="Synchronization Status")
+        paned.add(status_frame)
         
-        # Status Treeview with scrollbars
-        status_tree_frame = ttk.Frame(status_frame)
-        status_tree_frame.pack(fill='both', expand=True)
-        
-        self.status_tree = ttk.Treeview(status_tree_frame, 
+        # Status Treeview
+        self.status_tree = ttk.Treeview(status_frame, 
                                     columns=("timestamp", "rule", "records", "success", "errors"),
                                     show='headings',
-                                    height=10)
-        
-        status_x_scroll = ttk.Scrollbar(status_tree_frame, orient='horizontal', 
-                                    command=self.status_tree.xview)
-        status_y_scroll = ttk.Scrollbar(status_tree_frame, orient='vertical', 
-                                    command=self.status_tree.yview)
-        
-        self.status_tree.configure(xscrollcommand=status_x_scroll.set, 
-                                yscrollcommand=status_y_scroll.set)
-        
-        # Configure status columns
+                                    height=8)
         self.status_tree.heading("timestamp", text="Timestamp")
         self.status_tree.heading("rule", text="Rule Name")
         self.status_tree.heading("records", text="Records Processed")
         self.status_tree.heading("success", text="Success Count")
         self.status_tree.heading("errors", text="Error Count")
         
-        # Set column widths
-        self.status_tree.column("timestamp", width=150, minwidth=150)
-        self.status_tree.column("rule", width=150, minwidth=100)
-        self.status_tree.column("records", width=100, minwidth=100)
-        self.status_tree.column("success", width=100, minwidth=100)
-        self.status_tree.column("errors", width=100, minwidth=100)
+        # Add scrollbar to status tree
+        status_scroll = ttk.Scrollbar(status_frame, orient="vertical", command=self.status_tree.yview)
+        self.status_tree.configure(yscrollcommand=status_scroll.set)
         
-        # Pack status tree and scrollbars
+        # Pack status tree and scrollbar  
         self.status_tree.pack(side='left', fill='both', expand=True)
-        status_y_scroll.pack(side='right', fill='y')
-        status_x_scroll.pack(side='bottom', fill='x')
-        
+        status_scroll.pack(side='right', fill='y')
+
         # Control buttons frame
-        control_frame = ttk.Frame(content_frame)
-        control_frame.pack(fill='x', padx=5, pady=5)
+        control_frame = ttk.Frame(frame)
+        control_frame.pack(fill='x', padx=10, pady=5)
+
+        # Left side buttons
+        left_buttons_frame = ttk.Frame(control_frame)
+        left_buttons_frame.pack(side='left')
         
-        # Add auto-refresh checkbox
-        self.auto_refresh_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(control_frame, text="Auto Refresh", 
-                        variable=self.auto_refresh_var).pack(side='left', padx=5)
-        
-        ttk.Button(control_frame, text="Refresh Status", 
+        ttk.Button(left_buttons_frame, text="Refresh Status", 
                 command=self.refresh_monitoring).pack(side='left', padx=5)
-        ttk.Button(control_frame, text="Show Topics",
+        ttk.Button(left_buttons_frame, text="Show Topics",
                 command=lambda: self.show_rule_topics(
                     self.rules_tree.item(self.rules_tree.selection()[0])['values'][0]
                     if self.rules_tree.selection() else None
                 )).pack(side='left', padx=5)
-        ttk.Button(control_frame, text="View Action History", 
+        ttk.Button(left_buttons_frame, text="View Action History", 
                 command=self.show_action_history).pack(side='left', padx=5)
+        
+        # Add this to the create_monitoring method, in the control_frame
         ttk.Button(control_frame, text="Show Log Viewer", 
-                command=self.create_log_viewer).pack(side='left', padx=5)
-        
-        # Configure canvas scrolling
-        def configure_scroll(event):
-            canvas.configure(scrollregion=canvas.bbox('all'))
-        content_frame.bind('<Configure>', configure_scroll)
-        
-        # Start auto-refresh
-        self.start_auto_refresh()
-        
-        return frame
+               command=self.create_log_viewer).pack(side='left', padx=5)
 
+        return frame
 
     def get_rule_topics(self, rule_name):
         """Get all topics associated with a rule"""
@@ -4587,7 +4450,64 @@ class DataIntegrationIDE:
             self.logger.error(f"Failed to start sync consumer: {str(e)}")
             return False
 
+    def process_sink_message(self, message, mapping):
+        """Process a message and sink it to Neo4j"""
+        try:
+            # Parse message
+            data = json.loads(message.value().decode('utf-8'))
+            label = mapping['target']['label']
+            
+            # Prepare properties with proper type conversion
+            properties = {}
+            for source_col, target_prop in mapping['columns'].items():
+                if source_col in data:
+                    value = data[source_col]
+                    if isinstance(value, (int, float, str, bool)) and value is not None:
+                        properties[target_prop] = value
+                    elif isinstance(value, (dict, list)):
+                        properties[target_prop] = json.dumps(value)
+                    elif value is not None:
+                        properties[target_prop] = str(value)
 
+            # Ensure ID property
+            if 'id' not in properties:
+                properties['id'] = str(uuid.uuid4())
+
+            # Connect to Neo4j
+            from neo4j import GraphDatabase
+            config = {key: entry.get() for key, entry in self.neo4j_entries.items()}
+            
+            driver = GraphDatabase.driver(
+                config['url'],
+                auth=(config['user'], config['password'])
+            )
+
+            with driver.session() as session:
+                try:
+                    # Create merge query
+                    property_string = ", ".join([f"n.{key} = ${key}" for key in properties])
+                    query = f"""
+                        MERGE (n:{label} {{id: $id}})
+                        SET {property_string}
+                        RETURN n
+                    """
+                    session.run(query, **properties)
+                    
+                except Exception as e:
+                    if "UnknownLabelWarning" in str(e):
+                        # Create label and retry
+                        self.initialize_neo4j_schema(label)
+                        session.run(query, **properties)
+                    else:
+                        raise e
+
+            driver.close()
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to process sink message: {str(e)}")
+            return False
+    
     
     def stop_sync_for_rule(self, rule_name):
         """Stop synchronization for a specific rule"""

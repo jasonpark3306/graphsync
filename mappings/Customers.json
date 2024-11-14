@@ -7,5 +7,15 @@
     "type": "node",
     "label": "Customers"
   },
-  "columns": {}
+  "columns": {
+    "id": "id",
+    "created_at": "created_at",
+    "email": "email",
+    "phone": "phone",
+    "address": "address",
+    "city": "city",
+    "country": "country",
+    "postal_code": "postal_code",
+    "name": "name"
+  }
 }
