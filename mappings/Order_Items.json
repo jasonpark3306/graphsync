@@ -1,0 +1,18 @@
+{
+  "source": {
+    "type": "postgresql",
+    "table": "order_items"
+  },
+  "target": {
+    "type": "node",
+    "label": "Order_Items"
+  },
+  "columns": {
+    "id": "id",
+    "order_id": "order_id",
+    "product_id": "product_id",
+    "quantity": "quantity",
+    "price_at_time": "price_at_time",
+    "created_at": "created_at"
+  }
+}

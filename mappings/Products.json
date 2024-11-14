@@ -1,0 +1,19 @@
+{
+  "source": {
+    "type": "postgresql",
+    "table": "products"
+  },
+  "target": {
+    "type": "node",
+    "label": "Products"
+  },
+  "columns": {
+    "price": "price",
+    "is_active": "is_active",
+    "created_at": "created_at",
+    "id": "id",
+    "stock": "stock",
+    "name": "name",
+    "category": "category"
+  }
+}

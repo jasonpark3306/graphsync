@@ -7,5 +7,13 @@
     "type": "node",
     "label": "Orders"
   },
-  "columns": {}
+  "columns": {
+    "customer_id": "customer_id",
+    "order_date": "order_date",
+    "created_at": "created_at",
+    "id": "id",
+    "status": "status",
+    "payment_info": "payment_info",
+    "payment_exp": "payment_exp"
+  }
 }
